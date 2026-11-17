@@ -1842,7 +1842,7 @@ window.__ModuleLoader__.load({
       const rawChanges = Array.isArray(activity.changes) ? activity.changes.filter(isObject) : [];
       const changes = rawChanges.filter(function notRemoved(change) {
         return removedIds.indexOf(str(change.itemId)) < 0;
-      }).slice(0, 3);
+      }).slice(0, 4);
       const changedAnything = created + updated + attention > 0 || rawChanges.length > 0;
 
       const dismiss = function dismiss() {
@@ -1946,13 +1946,16 @@ window.__ModuleLoader__.load({
           bodyNodes.push(h('ul', { key: 'changes', className: 'dshr-toastChanges', 'aria-label': t('toast.changes') }, changes.map(function renderChange(change, index) {
             const kind = str(change.kind);
             const itemId = str(change.itemId);
-            return h('li', { key: itemId + ':' + index, className: 'dshr-change', title: str(change.detail) || undefined },
-              h('span', { className: 'dshr-kindBadge', 'data-kind': kind }, kindLabel(t, kind)),
-              h('span', { className: 'dshr-changeTitle' }, str(change.title) || t('toast.unknownItem')),
-              itemId ? h('span', { className: 'dshr-changeActions' },
-                h('button', { type: 'button', className: 'dshr-btn dshr-btn--ghost dshr-btn--small', disabled: busy, onClick: function onClick() { editChange(change); } }, t('toast.edit')),
-                h('button', { type: 'button', className: 'dshr-btn dshr-btn--ghost dshr-btn--small dshr-btn--danger', disabled: busy, onClick: function onClick() { deleteChange(change); } }, t('toast.delete'))
-              ) : null
+            return h('li', { key: itemId + ':' + index, className: 'dshr-change' },
+              h('div', { className: 'dshr-changeTop' },
+                h('span', { className: 'dshr-kindBadge', 'data-kind': kind }, kindLabel(t, kind)),
+                h('span', { className: 'dshr-changeTitle', title: str(change.title) }, str(change.title) || t('toast.unknownItem')),
+                itemId ? h('span', { className: 'dshr-changeActions' },
+                  h('button', { type: 'button', className: 'dshr-btn dshr-btn--ghost dshr-btn--small', disabled: busy, onClick: function onClick() { editChange(change); } }, t('toast.edit')),
+                  h('button', { type: 'button', className: 'dshr-btn dshr-btn--ghost dshr-btn--small dshr-btn--danger', disabled: busy, onClick: function onClick() { deleteChange(change); } }, t('toast.delete'))
+                ) : null
+              ),
+              str(change.detail) ? h('p', { className: 'dshr-changeDetail' }, str(change.detail)) : null
             );
           })));
         }
@@ -2313,32 +2316,34 @@ window.__ModuleLoader__.load({
       .dshr-spacer{flex:1}
       .dshr-spinner{flex:none;width:14px;height:14px;border:2px solid var(--dsw-alias-border-l3);border-top-color:var(--dsw-alias-state-business-primary);border-radius:50%;animation:dshr-spin .8s linear infinite}
       .dshr-pulseDot{flex:none;width:8px;height:8px;border-radius:50%;background:var(--dsw-alias-state-business-primary);animation:dshr-pulse 1.2s ease-in-out infinite}
-      .dshr-toast{box-sizing:border-box;position:fixed;top:12px;right:12px;z-index:40;width:290px;max-width:calc(100vw - 24px);max-height:42vh;overflow:hidden;padding:9px 11px 8px;border:.5px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-lg);background:var(--dsw-alias-bg-layer-2);box-shadow:var(--dsw-elevation-panel);color:var(--dsw-alias-label-primary);font-family:var(--dsw-font-family);font-size:13px;line-height:1.5;pointer-events:auto;transition:opacity .32s ease,transform .32s ease}
+      .dshr-toast{box-sizing:border-box;position:fixed;top:16px;right:16px;z-index:40;width:380px;max-width:calc(100vw - 24px);max-height:54vh;overflow:hidden;padding:12px 14px 10px;border:.5px solid var(--dsw-alias-border-l2);border-radius:var(--dsw-radius-lg);background:var(--dsw-alias-bg-layer-2);box-shadow:var(--dsw-elevation-panel);color:var(--dsw-alias-label-primary);font-family:var(--dsw-font-family);font-size:13px;line-height:1.5;pointer-events:auto;transition:opacity .32s ease,transform .32s ease}
       .dshr-toast--fading{opacity:0;transform:translateY(-4px);pointer-events:none}
-      .dshr-toastScroll{max-height:calc(42vh - 24px);overflow:auto;scrollbar-width:thin;scrollbar-color:var(--dsw-alias-scrollbar-bg-l2) var(--dsw-alias-bg-base)}
-      .dshr-toastTimer{position:absolute;top:0;left:0;right:0;height:2px;overflow:hidden;background:var(--dsw-alias-bg-layer-3);pointer-events:none}
+      .dshr-toastScroll{max-height:calc(54vh - 30px);overflow:auto;scrollbar-width:thin;scrollbar-color:var(--dsw-alias-scrollbar-bg-l2) var(--dsw-alias-bg-base)}
+      .dshr-toastTimer{position:absolute;top:0;left:0;right:0;height:3px;overflow:hidden;background:var(--dsw-alias-bg-layer-3);pointer-events:none}
       .dshr-toastTimerFill{height:100%;background:var(--dsw-alias-state-business-primary);transition:width .12s linear}
       .dshr-toastTimerFill--indeterminate{width:40%;animation:dshr-indeterminate 1.2s ease-in-out infinite}
       .dshr-toast[data-paused=true] .dshr-toastTimerFill{opacity:.6}
-      .dshr-toastHead{display:flex;align-items:center;gap:6px;min-width:0}
-      .dshr-toastTitle{flex:1;min-width:0;margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;font-weight:500;line-height:19px}
-      .dshr-toastBody{margin:3px 0 0;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:17px}
+      .dshr-toastHead{display:flex;align-items:center;gap:8px;min-width:0}
+      .dshr-toastTitle{flex:1;min-width:0;margin:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:14px;font-weight:500;line-height:20px}
+      .dshr-toastBody{margin:4px 0 0;color:var(--dsw-alias-label-secondary);font-size:13px;line-height:19px}
       .dshr-toastErrorText{margin:6px 0 0;color:var(--dsw-alias-state-error-primary);font-size:12px;line-height:19px;overflow-wrap:anywhere}
       .dshr-progress{position:relative;height:3px;margin-top:8px;overflow:hidden;border-radius:999px;background:var(--dsw-alias-bg-layer-3)}
       .dshr-progress::after{content:"";position:absolute;top:0;bottom:0;width:40%;border-radius:999px;background:var(--dsw-alias-state-business-primary);animation:dshr-indeterminate 1.2s ease-in-out infinite}
-      .dshr-toastChanges{display:flex;flex-direction:column;gap:3px;max-height:104px;margin:7px 0 0;padding:0;overflow:auto;list-style:none}
-      .dshr-change{display:flex;align-items:center;gap:5px;min-width:0;padding:3px 6px;border-radius:6px;background:var(--dsw-alias-bg-layer-1)}
+      .dshr-toastChanges{display:flex;flex-direction:column;gap:6px;max-height:176px;margin:8px 0 0;padding:0;overflow:auto;list-style:none}
+      .dshr-change{display:flex;flex-direction:column;gap:2px;min-width:0;padding:6px 8px;border-radius:8px;background:var(--dsw-alias-bg-layer-1)}
       .dshr-changeTop{display:flex;align-items:center;gap:6px;min-width:0}
       .dshr-kindBadge{flex:none;padding:0 5px;border-radius:999px;background:var(--dsw-alias-bg-layer-3);color:var(--dsw-alias-label-secondary);font-size:11px;line-height:16px;white-space:nowrap}
       .dshr-kindBadge[data-kind=created]{color:var(--dsw-alias-state-success-primary)}
       .dshr-kindBadge[data-kind=updated]{color:var(--dsw-alias-state-business-primary)}
       .dshr-kindBadge[data-kind=attention]{color:var(--dsw-alias-state-warn-primary)}
-      .dshr-changeTitle{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;line-height:17px}
+      .dshr-changeTitle{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;font-weight:500;line-height:18px}
             .dshr-changeActions{display:flex;flex:none;justify-content:flex-end;gap:1px;margin-left:auto}
-      .dshr-toastFooter{display:flex;flex-wrap:wrap;align-items:center;justify-content:flex-end;gap:5px;margin-top:7px;padding-top:6px;border-top:.5px solid var(--dsw-alias-border-l2)}
-      .dshr-toastFooter .dshr-btn{height:24px;padding:0 8px;font-size:12px}
-      .dshr-toastChanges .dshr-btn--small{height:20px;padding:0 5px;font-size:11px;line-height:16px}
-      .dshr-toast .dshr-iconBtn{width:22px;height:22px;font-size:14px}
+      .dshr-changeTop{display:flex;align-items:center;gap:6px;min-width:0}
+      .dshr-changeDetail{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;margin:0;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:17px;overflow-wrap:anywhere}
+      .dshr-toastFooter{display:flex;flex-wrap:wrap;align-items:center;justify-content:flex-end;gap:6px;margin-top:9px;padding-top:8px;border-top:.5px solid var(--dsw-alias-border-l2)}
+      .dshr-toastFooter .dshr-btn{height:26px;padding:0 9px;font-size:12px}
+      .dshr-toastChanges .dshr-btn--small{height:22px;padding:0 6px;font-size:11px;line-height:16px}
+      .dshr-toast .dshr-iconBtn{width:24px;height:24px;font-size:15px}
       .dshr-page button:focus-visible,.dshr-page input:focus-visible,.dshr-page textarea:focus-visible,.dshr-page select:focus-visible,.dshr-page [role=button]:focus-visible,.dshr-toast button:focus-visible{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));outline-offset:2px}
       @media (hover:hover){
         .dshr-btn:hover:not(:disabled){background:var(--dsw-alias-interactive-bg-hover);border-color:var(--dsw-alias-border-l2)}

@@ -52,7 +52,12 @@ prioritize it.
   then counts down (12 s) and the popup fades. The countdown pauses on hover, on
   keyboard focus, and while the page/window loses focus. Notifications never stack:
   runs completed while the page was unfocused are collapsed into one aggregated
-  **While you were away** popup (built from a Host-side activity rollup).
+  **While you were away** popup, built from a Host-side activity rollup and the
+  last-seen watermark. Its line reads as *N dreaming passes since you last checked ·
+  X new reminders · Y grading updates · Z need your attention*: `N` is the number of
+  automatic passes folded in (one every 10 min by default), `X` counts reminders
+  created, `Y` counts grading/status update events (the same item can be re-graded
+  many times), and `Z` counts **distinct open items** above the attention threshold.
 - **Agent tool.** `reminders` with `list/get/create/update/delete/item_unlock/
   group_create/group_delete/dream_run/dream_status/undo_dream/update_settings/
   learning_status/learning_update/learning_reset/models_list`, so the agent can read

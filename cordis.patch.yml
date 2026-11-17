@@ -1,0 +1,22 @@
+# dsh-reminders bundle patch layer.
+#
+# Inserts the Host row of the reminders plugin. The Host half owns durable state,
+# the dreaming engine, the authenticated /api HTTP routes, and the `reminders`
+# agent tool. The Client half (package.json `dsh.client`) renders the sidebar
+# entry, the main Reminders panel, and the top-right dreaming popup.
+#
+# Edit `config` to change defaults; the same values are also editable at runtime
+# through the plugin UI (stored in the plugin's own state file):
+#   dreamEnabled              bool     default true
+#   dreamIntervalMinutes      number   default 10
+#   windowHours               number   default 72   (sessions touched within)
+#   maxSessions               number   default 12
+#   staleHours                number   default 24
+#   forgetHours               number   default 72
+#   dataDir                   string   default $DSH_HOME/reminders
+- insert:
+    - id: reminders
+      name: dsh-reminders-plugin
+      config:
+        dreamEnabled: true
+        dreamIntervalMinutes: 10

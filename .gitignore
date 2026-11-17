@@ -1,0 +1,6 @@
+# Local installs and build artifacts
+node_modules/
+.npm-cache/
+*.tgz
+*.log
+.DS_Store

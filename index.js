@@ -1,0 +1,1922 @@
+/**
+ * dsh-reminders Host plugin.
+ *
+ * Owns the durable reminder list, the "dreaming" engine that combs recently
+ * accessed Sessions, the authenticated `/api/dsh-reminders/*` HTTP routes used
+ * by the browser half, and the `reminders` agent tool. Everything the model or
+ * the UI sees is derived from this store; Session data is only read, never
+ * written.
+ *
+ * Verified seams (DSH 0.2.2-rc.1 profile `web`):
+ * - `ctx.tools.register(definition)` + `inject: ['tools']` for the agent tool.
+ * - `ctx.connection.fetch.register({path, methods, requestBody, fetch})` mounts
+ *   exact Fetch routes on the authenticated `/api` channel.
+ * - `ctx.sessionQuery.listSessions/readTitleSnapshots` and
+ *   `ctx.sessionPersistence.list/open` read the Session corpus read-only.
+ * - `ctx.sessions.list()` exposes live Sessions for fresher event reads.
+ *
+ * @module dsh-reminders-plugin
+ */
+import { stat, mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { homedir } from 'node:os'
+import { basename, join } from 'node:path'
+import { randomBytes } from 'node:crypto'
+
+export const name = 'reminders'
+export const inject = ['tools']
+
+/** Authenticated route paths (Connection requires the `/api` prefix). */
+const ROUTE_STATE = '/api/dsh-reminders/state'
+const ROUTE_ACTION = '/api/dsh-reminders/action'
+
+/** Browser/main-panel identity shared with the Client half. */
+const PANEL_ID = 'reminders'
+const TOOL_NAME = 'reminders'
+
+const STATE_VERSION = 1
+const DEFAULT_GROUP_NAME = 'General'
+const ACTIVITY_KEEP = 12
+/** Changes retained per activity rollup (the long-absence aggregate). */
+const ROLLUP_CHANGES_KEEP = 60
+const SESSION_META_KEEP = 400
+const MAX_TITLE = 200
+const MAX_TEXT = 4000
+const MAX_NEXT_STEP = 400
+const STATUSES = ['todo', 'doing', 'blocked', 'done']
+
+/** A user-visible operation failure with a stable code. */
+class ReminderError extends Error {
+  /** @param {string} code @param {string} message */
+  constructor(code, message) {
+    super(message)
+    this.name = 'ReminderError'
+    this.code = code
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Small pure helpers
+// ---------------------------------------------------------------------------
+
+/** @returns {number} current epoch milliseconds */
+function nowMs() {
+  return Date.now()
+}
+
+/**
+ * Clamp a finite number.
+ * @param {number} value @param {number} lo @param {number} hi
+ */
+function clamp(value, lo, hi) {
+  return Math.min(hi, Math.max(lo, value))
+}
+
+/**
+ * Read a numeric option with clamping, falling back when invalid.
+ * @param {unknown} value @param {number} fallback @param {number} lo @param {number} hi
+ */
+function numberOr(value, fallback, lo, hi) {
+  const n = typeof value === 'string' ? Number(value) : value
+  if (typeof n !== 'number' || !Number.isFinite(n)) return fallback
+  return clamp(Math.round(n), lo, hi)
+}
+
+/** @param {unknown} value @param {boolean} fallback */
+function boolOr(value, fallback) {
+  return typeof value === 'boolean' ? value : fallback
+}
+
+/**
+ * Normalize a single line of text.
+ * @param {unknown} value @param {number} max
+ */
+function cleanText(value, max) {
+  if (typeof value !== 'string') return ''
+  return value.replace(/\u0000/g, '').replace(/\r\n?/g, '\n').trim().slice(0, max)
+}
+
+/**
+ * First line of some possibly multi-line text.
+ * @param {unknown} value @param {number} max
+ */
+function cleanLine(value, max) {
+  const text = cleanText(value, max)
+  const line = text.split('\n').find((part) => part.trim().length > 0) ?? ''
+  return line.trim().slice(0, max)
+}
+
+/** @param {string} prefix */
+function newId(prefix) {
+  return `${prefix}-${randomBytes(5).toString('hex')}`
+}
+
+/**
+ * Normalize a group name into a comparison key.
+ * @param {string} name
+ */
+function groupKey(name) {
+  const key = String(name)
+    .toLowerCase()
+    .replace(/[^a-z0-9\u4e00-\u9fff]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+  return key || 'general'
+}
+
+/** Stop words ignored by title similarity. */
+const STOP_WORDS = new Set([
+  'the', 'and', 'for', 'with', 'from', 'into', 'this', 'that', 'then', 'than',
+  'are', 'was', 'were', 'you', 'your', 'our', 'its', 'not', 'but', 'all', 'can',
+  'will', 'would', 'should', 'could', 'use', 'using', 'make', 'made', 'please',
+  'need', 'needs', 'want', 'wants', 'let', 'get', 'got', 'add', 'adds', 'fix',
+  'fixes', 'run', 'runs', 'via', 'per', '关于', '以及', '一个',
+])
+
+/** @param {unknown} text */
+function tokenize(text) {
+  const words = String(text ?? '')
+    .toLowerCase()
+    .split(/[^a-z0-9\u4e00-\u9fff]+/)
+    .filter((word) => word.length > 2 && !STOP_WORDS.has(word))
+  return new Set(words)
+}
+
+/**
+ * Jaccard similarity of two token sets.
+ * @param {Set<string>} a @param {Set<string>} b
+ */
+function jaccard(a, b) {
+  if (a.size === 0 || b.size === 0) return 0
+  let shared = 0
+  for (const token of a) if (b.has(token)) shared += 1
+  return shared / (a.size + b.size - shared)
+}
+
+/**
+ * Freshness bucket from the last touch timestamp.
+ * @param {number} lastTouched @param {{staleHours:number,forgetHours:number}} settings @param {number} now
+ * @returns {'fresh'|'warm'|'stale'|'cold'}
+ */
+function deriveFreshness(lastTouched, settings, now) {
+  const age = now - (Number.isFinite(lastTouched) ? lastTouched : now)
+  const hours = age / 3_600_000
+  if (hours <= 2) return 'fresh'
+  if (hours <= (settings.staleHours ?? 24)) return 'warm'
+  if (hours <= (settings.forgetHours ?? 72)) return 'stale'
+  return 'cold'
+}
+
+/**
+ * Project directory name used as the default group name.
+ * @param {string|undefined} cwd
+ */
+function groupNameForCwd(cwd) {
+  if (typeof cwd !== 'string' || cwd.length === 0) return DEFAULT_GROUP_NAME
+  const name = basename(cwd.replace(/[\\/]+$/, ''))
+  return name.trim().length > 0 ? name.trim() : DEFAULT_GROUP_NAME
+}
+
+/**
+ * Join the text blocks of a stored message.
+ * @param {{content?: Array<{type?:string,text?:string}>}|undefined} message
+ * @param {number} max
+ */
+function messageText(message, max) {
+  const blocks = Array.isArray(message?.content) ? message.content : []
+  const parts = []
+  for (const block of blocks) {
+    if (block && block.type === 'text' && typeof block.text === 'string') parts.push(block.text)
+  }
+  return cleanText(parts.join('\n'), max)
+}
+
+/**
+ * Sources that appear as user-role events but are harness context, not the
+ * person's own request; they never describe work.
+ */
+const HUMAN_USER_KINDS = new Set(['user', 'user-rpc'])
+
+/**
+ * Text of a stored `user/message` event. Unlike `assistant/message` and
+ * `tool/result`, that event stores the message fields directly on `data`, and
+ * only a human/agent prompt describes work (context snapshots are ignored).
+ * @param {{data?: Record<string, any>}|undefined} event
+ * @param {number} max
+ */
+function userMessageText(event, max) {
+  const data = event?.data
+  if (!data || typeof data !== 'object') return ''
+  const kind = typeof data.source?.kind === 'string' ? data.source.kind : ''
+  if (kind && !HUMAN_USER_KINDS.has(kind)) return ''
+  return messageText(data, max)
+}
+
+/**
+ * Merge two event arrays by seq, ascending.
+ * @param {Array<object>} first @param {Array<object>} last
+ */
+function mergeEvents(first, last) {
+  if (last.length === 0) return first
+  const bySeq = new Map()
+  for (const event of first) bySeq.set(event.seq, event)
+  for (const event of last) bySeq.set(event.seq, event)
+  return [...bySeq.values()].sort((a, b) => a.seq - b.seq)
+}
+
+/**
+ * Derive the Session's current work state from its last durable event.
+ * @param {object|undefined} lastEvent
+ * @returns {'settled'|'working'|'blocked'|'unknown'}
+ */
+function deriveSessionState(lastEvent) {
+  if (!lastEvent) return 'unknown'
+  if (lastEvent.type === 'turn/end') {
+    const kind = lastEvent.data?.reason?.kind
+    if (kind === 'error' || kind === 'aborted' || kind === 'blocked' || kind === 'interrupted') return 'blocked'
+    return 'settled'
+  }
+  if (
+    lastEvent.type === 'turn/start' || lastEvent.type === 'step/start' ||
+    lastEvent.type === 'user/message' || lastEvent.type === 'assistant/message' ||
+    lastEvent.type === 'tool/call' || lastEvent.type === 'tool/result'
+  ) {
+    return 'working'
+  }
+  return 'working'
+}
+
+/**
+ * Extract the research surface of one Session from its event sample.
+ * @param {Array<object>} events
+ */
+function analyzeEvents(events) {
+  let firstUserText = ''
+  let lastUserText = ''
+  let lastAssistantText = ''
+  let title = ''
+  let lastError = ''
+  let turnEnds = 0
+  let lastTime = 0
+  let lastEvent
+  const tools = []
+  for (const event of events) {
+    if (!event || typeof event !== 'object') continue
+    lastEvent = event
+    if (typeof event.time === 'number' && event.time > lastTime) lastTime = event.time
+    switch (event.type) {
+      case 'user/message': {
+        const text = userMessageText(event, 2000)
+        if (text) {
+          if (!firstUserText) firstUserText = text
+          lastUserText = text
+        }
+        break
+      }
+      case 'assistant/message': {
+        const text = messageText(event.data?.message, 4000)
+        if (text) lastAssistantText = text
+        break
+      }
+      case 'tool/call': {
+        const toolName = typeof event.data?.name === 'string' ? event.data.name : ''
+        if (toolName && !tools.includes(toolName) && tools.length < 8) tools.push(toolName)
+        break
+      }
+      case 'tool/result': {
+        if (event.data?.error) {
+          const reason = event.data.error.reason || event.data.error.code || event.data.error.name
+          if (reason) lastError = cleanLine(reason, 160)
+        }
+        break
+      }
+      case 'turn/end': {
+        turnEnds += 1
+        break
+      }
+      case 'session/title': {
+        if (typeof event.data?.title === 'string') title = cleanLine(event.data.title, MAX_TITLE)
+        break
+      }
+      default:
+        break
+    }
+  }
+  return {
+    firstUserText, lastUserText, lastAssistantText, title, lastError, turnEnds, lastTime, lastEvent,
+    tools,
+    state: deriveSessionState(lastEvent),
+  }
+}
+
+/**
+ * Pick a reminder title for a scanned Session.
+ * @param {{title:string,firstUserText:string,lastUserText:string,cwd?:string}} summary
+ */
+function titleForSession(summary) {
+  if (summary.title) return cleanLine(summary.title, MAX_TITLE)
+  if (summary.firstUserText) return cleanLine(summary.firstUserText, 120)
+  if (summary.lastUserText) return cleanLine(summary.lastUserText, 120)
+  if (summary.cwd) return cleanLine(groupNameForCwd(summary.cwd), MAX_TITLE)
+  return 'Untitled work'
+}
+
+/**
+ * Heuristic progress suggested for a tracked Session (never decreases an item).
+ * @param {{turnEnds:number,lastUserText:string,lastAssistantText:string,state:string}} summary
+ */
+function suggestedProgress(summary) {
+  let progress = 20 + Math.min(40, summary.turnEnds * 6)
+  if (summary.lastAssistantText) progress += 8
+  if (summary.lastUserText) progress += 4
+  if (summary.state === 'blocked') progress = Math.min(progress, 45)
+  return clamp(Math.round(progress), 10, 85)
+}
+
+// ---------------------------------------------------------------------------
+// Durable store
+// ---------------------------------------------------------------------------
+
+/** @returns {object} a fresh empty persisted state */
+function emptyState(defaults) {
+  return {
+    version: STATE_VERSION,
+    revision: 0,
+    createdAt: nowMs(),
+    updatedAt: nowMs(),
+    settings: {
+      dreamEnabled: defaults.dreamEnabled,
+      dreamIntervalMinutes: defaults.dreamIntervalMinutes,
+      windowHours: defaults.windowHours,
+      staleHours: defaults.staleHours,
+      forgetHours: defaults.forgetHours,
+      maxSessions: defaults.maxSessions,
+    },
+    groups: [],
+    items: [],
+    sessionMeta: {},
+    activities: [],
+    activityRollup: null,
+    lastDreamAt: 0,
+  }
+}
+
+/**
+ * Coerce a persisted item into the current shape, dropping junk.
+ * @param {unknown} raw
+ * @returns {object|null}
+ */
+function normalizeItem(raw) {
+  if (!raw || typeof raw !== 'object') return null
+  const value = /** @type {Record<string, any>} */ (raw)
+  if (typeof value.id !== 'string' || typeof value.title !== 'string') return null
+  const status = STATUSES.includes(value.status) ? value.status : 'todo'
+  return {
+    id: value.id,
+    title: cleanLine(value.title, MAX_TITLE) || 'Untitled work',
+    notes: cleanText(value.notes, MAX_TEXT),
+    nextStep: cleanLine(value.nextStep, MAX_NEXT_STEP),
+    groupId: typeof value.groupId === 'string' ? value.groupId : '',
+    status,
+    progress: numberOr(value.progress, status === 'done' ? 100 : 0, 0, 100),
+    importance: numberOr(value.importance, 3, 1, 5),
+    pinned: boolOr(value.pinned, false),
+    source: value.source === 'dream' ? 'dream' : 'manual',
+    autoManaged: boolOr(value.autoManaged, value.source === 'dream'),
+    sessionIds: Array.isArray(value.sessionIds)
+      ? [...new Set(value.sessionIds.filter((id) => typeof id === 'string'))].slice(0, 40)
+      : [],
+    createdAt: numberOr(value.createdAt, nowMs(), 0, Number.MAX_SAFE_INTEGER),
+    updatedAt: numberOr(value.updatedAt, nowMs(), 0, Number.MAX_SAFE_INTEGER),
+    lastTouched: numberOr(value.lastTouched, value.updatedAt ?? nowMs(), 0, Number.MAX_SAFE_INTEGER),
+    lastDreamBatchId: typeof value.lastDreamBatchId === 'string' ? value.lastDreamBatchId : undefined,
+  }
+}
+
+/**
+ * Coerce a persisted group into the current shape.
+ * @param {unknown} raw
+ */
+function normalizeGroup(raw) {
+  if (!raw || typeof raw !== 'object') return null
+  const value = /** @type {Record<string, any>} */ (raw)
+  if (typeof value.id !== 'string' || typeof value.name !== 'string') return null
+  const groupName = cleanLine(value.name, 60)
+  if (!groupName) return null
+  return {
+    id: value.id,
+    name: groupName,
+    createdAt: numberOr(value.createdAt, nowMs(), 0, Number.MAX_SAFE_INTEGER),
+  }
+}
+
+/**
+ * Coerce one list of activity changes.
+ * @param {unknown} raw @param {number} cap
+ */
+function normalizeChanges(raw, cap) {
+  if (!Array.isArray(raw)) return []
+  return raw.filter((change) => change && typeof change === 'object').slice(0, cap).map((change) => ({
+    itemId: typeof change.itemId === 'string' ? change.itemId : '',
+    title: cleanLine(change.title, MAX_TITLE),
+    kind: ['created', 'updated', 'attention', 'grouped'].includes(change.kind) ? change.kind : 'updated',
+    detail: cleanLine(change.detail, 240),
+  }))
+}
+
+/**
+ * Coerce the rolling aggregate of dream runs that left the recent activity window.
+ * @param {unknown} raw
+ */
+function normalizeRollup(raw) {
+  if (!raw || typeof raw !== 'object') return null
+  const value = /** @type {Record<string, any>} */ (raw)
+  const changes = normalizeChanges(value.changes, ROLLUP_CHANGES_KEEP)
+  const runs = numberOr(value.runs, 0, 0, 100_000)
+  if (runs <= 0 && changes.length === 0) return null
+  return {
+    startedAt: numberOr(value.startedAt, 0, 0, Number.MAX_SAFE_INTEGER),
+    endedAt: numberOr(value.endedAt, 0, 0, Number.MAX_SAFE_INTEGER),
+    runs,
+    created: numberOr(value.created, 0, 0, 100_000),
+    updated: numberOr(value.updated, 0, 0, 100_000),
+    attention: numberOr(value.attention, 0, 0, 100_000),
+    changes,
+  }
+}
+
+/**
+ * Coerce a persisted activity, dropping undo snapshots that no longer parse.
+ * @param {unknown} raw
+ */
+function normalizeActivity(raw) {
+  if (!raw || typeof raw !== 'object') return null
+  const value = /** @type {Record<string, any>} */ (raw)
+  if (typeof value.id !== 'string') return null
+  return {
+    id: value.id,
+    status: value.status === 'done' ? 'done' : value.status === 'error' ? 'error' : 'running',
+    startedAt: numberOr(value.startedAt, nowMs(), 0, Number.MAX_SAFE_INTEGER),
+    endedAt: typeof value.endedAt === 'number' ? value.endedAt : undefined,
+    scanned: numberOr(value.scanned, 0, 0, 10_000),
+    created: numberOr(value.created, 0, 0, 10_000),
+    updated: numberOr(value.updated, 0, 0, 10_000),
+    attention: numberOr(value.attention, 0, 0, 10_000),
+    summary: cleanLine(value.summary, 400),
+    error: typeof value.error === 'string' ? cleanLine(value.error, 400) : undefined,
+    undoable: boolOr(value.undoable, false),
+    undone: boolOr(value.undone, false),
+    changes: normalizeChanges(value.changes, 100),
+    undo: value.undo && typeof value.undo === 'object' && Array.isArray(value.undo.items) && Array.isArray(value.undo.groups)
+      ? { items: value.undo.items, groups: value.undo.groups }
+      : undefined,
+  }
+}
+
+/**
+ * Read and normalize a persisted state document.
+ * @param {unknown} raw @param {object} defaults
+ */
+function normalizeState(raw, defaults) {
+  const base = emptyState(defaults)
+  if (!raw || typeof raw !== 'object') return base
+  const value = /** @type {Record<string, any>} */ (raw)
+  const items = Array.isArray(value.items) ? value.items.map(normalizeItem).filter(Boolean) : []
+  const groups = Array.isArray(value.groups) ? value.groups.map(normalizeGroup).filter(Boolean) : []
+  const knownGroups = new Set(groups.map((group) => group.id))
+  const fallbackGroup = ensureDefaultGroup(groups)
+  for (const item of items) {
+    if (!item.groupId || !knownGroups.has(item.groupId)) item.groupId = fallbackGroup.id
+  }
+  const settings = value.settings && typeof value.settings === 'object' ? value.settings : {}
+  const sessionMeta = {}
+  if (value.sessionMeta && typeof value.sessionMeta === 'object') {
+    for (const [id, meta] of Object.entries(value.sessionMeta)) {
+      if (!meta || typeof meta !== 'object') continue
+      const entry = /** @type {Record<string, any>} */ (meta)
+      sessionMeta[id] = {
+        id,
+        title: cleanLine(entry.title, MAX_TITLE) || id,
+        cwd: typeof entry.cwd === 'string' ? entry.cwd : undefined,
+        lastTouched: numberOr(entry.lastTouched, 0, 0, Number.MAX_SAFE_INTEGER),
+      }
+    }
+  }
+  return {
+    version: STATE_VERSION,
+    revision: numberOr(value.revision, 0, 0, Number.MAX_SAFE_INTEGER),
+    createdAt: numberOr(value.createdAt, base.createdAt, 0, Number.MAX_SAFE_INTEGER),
+    updatedAt: numberOr(value.updatedAt, base.updatedAt, 0, Number.MAX_SAFE_INTEGER),
+    settings: {
+      dreamEnabled: boolOr(settings.dreamEnabled, defaults.dreamEnabled),
+      dreamIntervalMinutes: numberOr(settings.dreamIntervalMinutes, defaults.dreamIntervalMinutes, 1, 1440),
+      windowHours: numberOr(settings.windowHours, defaults.windowHours, 1, 720),
+      staleHours: numberOr(settings.staleHours, defaults.staleHours, 1, 720),
+      forgetHours: numberOr(settings.forgetHours, defaults.forgetHours, 1, 2160),
+      maxSessions: numberOr(settings.maxSessions, defaults.maxSessions, 1, 50),
+    },
+    groups,
+    items,
+    sessionMeta,
+    activities: Array.isArray(value.activities) ? value.activities.map(normalizeActivity).filter(Boolean).slice(0, ACTIVITY_KEEP) : [],
+    activityRollup: normalizeRollup(value.activityRollup),
+    lastDreamAt: numberOr(value.lastDreamAt, 0, 0, Number.MAX_SAFE_INTEGER),
+  }
+}
+
+/**
+ * Ensure the default group exists and return it.
+ * @param {Array<{id:string,name:string}>} groups
+ */
+function ensureDefaultGroup(groups) {
+  const existing = groups.find((group) => groupKey(group.name) === groupKey(DEFAULT_GROUP_NAME))
+  if (existing) return existing
+  const group = { id: newId('g'), name: DEFAULT_GROUP_NAME, createdAt: nowMs() }
+  groups.push(group)
+  return group
+}
+
+/** Durable reminder store: synchronous reads, serialized atomic writes. */
+class ReminderStore {
+  /**
+   * @param {string} dir @param {object} defaults
+   */
+  constructor(dir, defaults) {
+    this.dir = dir
+    this.file = join(dir, 'state.json')
+    this.defaults = defaults
+    this.state = emptyState(defaults)
+    this.ready = this.#load()
+    this.writeChain = Promise.resolve()
+    this.engineRunning = false
+  }
+
+  async #load() {
+    try {
+      const raw = await readFile(this.file, 'utf8')
+      const parsed = JSON.parse(raw)
+      this.state = normalizeState(parsed, this.defaults)
+      // A read-only config default may change between boots; persisted runtime
+      // settings win, but an absent settings block was already defaulted.
+      ensureDefaultGroup(this.state.groups)
+    } catch (error) {
+      if (error && error.code !== 'ENOENT') {
+        this.loadWarning = `reminders state was unreadable (${error.code ?? 'error'}); starting fresh`
+        try {
+          await rename(this.file, `${this.file}.corrupt-${nowMs()}`)
+        } catch {
+          // best effort: keep the unreadable file untouched
+        }
+      }
+      this.state = emptyState(this.defaults)
+      ensureDefaultGroup(this.state.groups)
+    }
+    return this.state
+  }
+
+  /** Bump the revision counter without persisting. */
+  touch() {
+    this.state.revision += 1
+    this.state.updatedAt = nowMs()
+  }
+
+  /** Persist the current state atomically, serialized behind earlier writes. */
+  persist() {
+    const snapshot = JSON.stringify(this.state, null, 2)
+    const file = this.file
+    this.writeChain = this.writeChain.then(async () => {
+      try {
+        await mkdir(this.dir, { recursive: true })
+        const temp = `${file}.tmp-${process.pid}-${randomBytes(3).toString('hex')}`
+        await writeFile(temp, snapshot, { mode: 0o600 })
+        await rename(temp, file)
+      } catch (error) {
+        this.loadWarning = `reminders state could not be saved (${error.code ?? 'error'})`
+      }
+    })
+    return this.writeChain
+  }
+
+  /** @param {string} name */
+  findGroupByName(name) {
+    const key = groupKey(name)
+    return this.state.groups.find((group) => groupKey(group.name) === key)
+  }
+
+  /** @param {string} id */
+  findGroup(id) {
+    return this.state.groups.find((group) => group.id === id)
+  }
+
+  /** @param {string} id */
+  findItem(id) {
+    return this.state.items.find((item) => item.id === id)
+  }
+
+  /**
+   * Resolve or create a group by display name.
+   * @param {string} name
+   * @returns {{group:object, created:boolean}}
+   */
+  groupForName(name) {
+    const cleanName = cleanLine(name, 60) || DEFAULT_GROUP_NAME
+    const existing = this.findGroupByName(cleanName)
+    if (existing) return { group: existing, created: false }
+    const group = { id: newId('g'), name: cleanName, createdAt: nowMs() }
+    this.state.groups.push(group)
+    return { group, created: true }
+  }
+
+  /**
+   * Project one item for the Client, with freshness and linked Session metadata.
+   * @param {object} item @param {number} now
+   */
+  itemView(item, now = nowMs()) {
+    return {
+      ...item,
+      freshness: deriveFreshness(item.lastTouched, this.state.settings, now),
+      sessions: item.sessionIds.map((id) => {
+        const meta = this.state.sessionMeta[id]
+        return meta
+          ? { id, title: meta.title, lastTouched: meta.lastTouched }
+          : { id, title: id, lastTouched: item.lastTouched }
+      }),
+    }
+  }
+
+  /** @param {object} activity */
+  activityView(activity) {
+    const { undo: _undo, ...rest } = activity
+    return rest
+  }
+
+  /**
+   * Public aggregate of dream runs outside the recent activity window, used by
+   * the Client to show one "while you were away" summary instead of stacked
+   * notifications after the page was unfocused for a long time.
+   */
+  rollupView() {
+    const rollup = this.state.activityRollup
+    if (!rollup) return null
+    return {
+      startedAt: rollup.startedAt,
+      endedAt: rollup.endedAt,
+      runs: rollup.runs,
+      created: rollup.created,
+      updated: rollup.updated,
+      attention: rollup.attention,
+      changes: rollup.changes.slice(0, ROLLUP_CHANGES_KEEP),
+    }
+  }
+
+  /**
+   * Fold one dropped activity into the rolling aggregate, merging changes by
+   * item so a long absence yields one row per item, not one per run.
+   * @param {object} activity
+   */
+  mergeActivityIntoRollup(activity) {
+    if (!activity || activity.status === 'running') return
+    const current = this.state.activityRollup ?? {
+      startedAt: activity.startedAt ?? 0,
+      endedAt: activity.endedAt ?? activity.startedAt ?? 0,
+      runs: 0,
+      created: 0,
+      updated: 0,
+      attention: 0,
+      changes: [],
+    }
+    current.startedAt = Math.min(current.startedAt || activity.startedAt || 0, activity.startedAt ?? 0)
+    current.endedAt = Math.max(current.endedAt, activity.endedAt ?? activity.startedAt ?? 0)
+    current.runs += 1
+    current.created += activity.created ?? 0
+    current.updated += activity.updated ?? 0
+    current.attention += activity.attention ?? 0
+    if (Array.isArray(activity.changes)) {
+      for (const change of activity.changes) {
+        const byItem = change.itemId ? current.changes.find((entry) => entry.itemId === change.itemId) : undefined
+        if (byItem) {
+          byItem.title = change.title
+          byItem.kind = change.kind
+          byItem.detail = change.detail
+        } else {
+          current.changes.push({ itemId: change.itemId, title: change.title, kind: change.kind, detail: change.detail })
+        }
+      }
+    }
+    if (current.changes.length > ROLLUP_CHANGES_KEEP) {
+      current.changes = current.changes.slice(current.changes.length - ROLLUP_CHANGES_KEEP)
+    }
+    this.state.activityRollup = current
+  }
+
+  /** Keep the recent activity window bounded, rolling the dropped tail up. */
+  pruneActivities() {
+    while (this.state.activities.length > ACTIVITY_KEEP) {
+      const dropped = this.state.activities.pop()
+      this.mergeActivityIntoRollup(dropped)
+    }
+  }
+
+  /** @param {number} now */
+  snapshot(now = nowMs()) {
+    const settings = this.state.settings
+    const activities = this.state.activities.slice(0, ACTIVITY_KEEP)
+    return {
+      ok: true,
+      revision: this.state.revision,
+      now,
+      panelId: PANEL_ID,
+      settings: {
+        dreamEnabled: settings.dreamEnabled,
+        dreamIntervalMinutes: settings.dreamIntervalMinutes,
+        windowHours: settings.windowHours,
+        staleHours: settings.staleHours,
+        forgetHours: settings.forgetHours,
+        maxSessions: settings.maxSessions,
+      },
+      groups: this.state.groups.map((group) => ({ id: group.id, name: group.name, createdAt: group.createdAt })),
+      items: this.state.items.map((item) => this.itemView(item, now)),
+      activities: activities.map((activity) => this.activityView(activity)),
+      dream: {
+        enabled: settings.dreamEnabled,
+        intervalMinutes: settings.dreamIntervalMinutes,
+        running: this.engineRunning,
+        nextRunAt: settings.dreamEnabled
+          ? (this.state.lastDreamAt || now) + settings.dreamIntervalMinutes * 60_000
+          : null,
+        lastRunAt: this.state.lastDreamAt || null,
+        activity: activities.length > 0 ? this.activityView(activities[0]) : null,
+        rollup: this.rollupView(),
+      },
+      loadWarning: this.loadWarning,
+    }
+  }
+
+  /**
+   * Record Session metadata linked from an item.
+   * @param {{id:string,title:string,lastTouched:number,cwd?:string}} summary
+   */
+  rememberSession(summary) {
+    this.state.sessionMeta[summary.id] = {
+      id: summary.id,
+      title: cleanLine(summary.title, MAX_TITLE) || summary.id,
+      cwd: summary.cwd,
+      lastTouched: summary.lastTouched,
+    }
+    const entries = Object.values(this.state.sessionMeta)
+    if (entries.length > SESSION_META_KEEP) {
+      entries.sort((a, b) => b.lastTouched - a.lastTouched)
+      this.state.sessionMeta = Object.fromEntries(entries.slice(0, SESSION_META_KEEP).map((entry) => [entry.id, entry]))
+    }
+  }
+
+  // -- mutations ------------------------------------------------------------
+
+  /**
+   * Create a manual (or tool-created) reminder item.
+   * @param {Record<string, any>} payload
+   */
+  createItem(payload) {
+    const title = cleanLine(payload?.title, MAX_TITLE)
+    if (!title) throw new ReminderError('invalid', 'A reminder needs a non-empty title.')
+    const now = nowMs()
+    const group = payload?.groupId
+      ? this.findGroup(payload.groupId)
+      : this.groupForName(payload?.group ?? DEFAULT_GROUP_NAME).group
+    if (!group) throw new ReminderError('not_found', 'The selected group does not exist.')
+    const status = STATUSES.includes(payload?.status) ? payload.status : 'todo'
+    const item = {
+      id: newId('r'),
+      title,
+      notes: cleanText(payload?.notes, MAX_TEXT),
+      nextStep: cleanLine(payload?.nextStep, MAX_NEXT_STEP),
+      groupId: group.id,
+      status,
+      progress: numberOr(payload?.progress, status === 'done' ? 100 : 0, 0, 100),
+      importance: numberOr(payload?.importance, 3, 1, 5),
+      pinned: boolOr(payload?.pinned, false),
+      source: 'manual',
+      autoManaged: false,
+      sessionIds: [],
+      createdAt: now,
+      updatedAt: now,
+      lastTouched: now,
+    }
+    this.state.items.push(item)
+    this.touch()
+    return item
+  }
+
+  /**
+   * Update a reminder item with a whitelisted patch.
+   * @param {string} id @param {Record<string, any>} patch
+   */
+  updateItem(id, patch) {
+    const item = this.findItem(id)
+    if (!item) throw new ReminderError('not_found', 'That reminder no longer exists.')
+    const next = patch && typeof patch === 'object' ? patch : {}
+    if (Object.prototype.hasOwnProperty.call(next, 'title')) {
+      const title = cleanLine(next.title, MAX_TITLE)
+      if (!title) throw new ReminderError('invalid', 'A reminder needs a non-empty title.')
+      item.title = title
+    }
+    if (Object.prototype.hasOwnProperty.call(next, 'notes')) item.notes = cleanText(next.notes, MAX_TEXT)
+    if (Object.prototype.hasOwnProperty.call(next, 'nextStep')) item.nextStep = cleanLine(next.nextStep, MAX_NEXT_STEP)
+    if (Object.prototype.hasOwnProperty.call(next, 'groupId')) {
+      if (!this.findGroup(next.groupId)) throw new ReminderError('not_found', 'The selected group does not exist.')
+      item.groupId = next.groupId
+    }
+    if (Object.prototype.hasOwnProperty.call(next, 'status')) {
+      if (!STATUSES.includes(next.status)) throw new ReminderError('invalid', 'Unknown status.')
+      item.status = next.status
+      if (next.status === 'done') {
+        item.progress = 100
+      } else if (item.progress === 100) {
+        item.progress = 90
+      }
+    }
+    if (Object.prototype.hasOwnProperty.call(next, 'progress')) item.progress = numberOr(next.progress, item.progress, 0, 100)
+    if (Object.prototype.hasOwnProperty.call(next, 'importance')) item.importance = numberOr(next.importance, item.importance, 1, 5)
+    if (Object.prototype.hasOwnProperty.call(next, 'pinned')) item.pinned = boolOr(next.pinned, item.pinned)
+    item.updatedAt = nowMs()
+    item.lastTouched = Math.max(item.lastTouched, item.updatedAt)
+    item.autoManaged = false
+    this.touch()
+    return item
+  }
+
+  /** @param {string} id */
+  deleteItem(id) {
+    const index = this.state.items.findIndex((item) => item.id === id)
+    if (index < 0) throw new ReminderError('not_found', 'That reminder no longer exists.')
+    const [removed] = this.state.items.splice(index, 1)
+    this.touch()
+    return removed
+  }
+
+  /** @param {string} name */
+  createGroup(name) {
+    const cleanName = cleanLine(name, 60)
+    if (!cleanName) throw new ReminderError('invalid', 'A group needs a non-empty name.')
+    const existing = this.findGroupByName(cleanName)
+    if (existing) return existing
+    const group = { id: newId('g'), name: cleanName, createdAt: nowMs() }
+    this.state.groups.push(group)
+    this.touch()
+    return group
+  }
+
+  /** @param {string} id @param {string} name */
+  renameGroup(id, name) {
+    const group = this.findGroup(id)
+    if (!group) throw new ReminderError('not_found', 'That group no longer exists.')
+    const cleanName = cleanLine(name, 60)
+    if (!cleanName) throw new ReminderError('invalid', 'A group needs a non-empty name.')
+    const clash = this.findGroupByName(cleanName)
+    if (clash && clash.id !== group.id) throw new ReminderError('invalid', 'Another group already uses that name.')
+    group.name = cleanName
+    this.touch()
+    return group
+  }
+
+  /** @param {string} id */
+  deleteGroup(id) {
+    const index = this.state.groups.findIndex((group) => group.id === id)
+    if (index < 0) throw new ReminderError('not_found', 'That group no longer exists.')
+    this.state.groups.splice(index, 1)
+    const fallback = ensureDefaultGroup(this.state.groups)
+    for (const item of this.state.items) {
+      if (item.groupId === id) item.groupId = fallback.id
+    }
+    this.touch()
+    return { id, movedTo: fallback.id }
+  }
+
+  /** @param {Record<string, any>} payload */
+  updateSettings(payload) {
+    const settings = this.state.settings
+    if (Object.prototype.hasOwnProperty.call(payload ?? {}, 'dreamEnabled')) {
+      settings.dreamEnabled = boolOr(payload.dreamEnabled, settings.dreamEnabled)
+    }
+    if (Object.prototype.hasOwnProperty.call(payload ?? {}, 'dreamIntervalMinutes')) {
+      settings.dreamIntervalMinutes = numberOr(payload.dreamIntervalMinutes, settings.dreamIntervalMinutes, 1, 1440)
+    }
+    if (Object.prototype.hasOwnProperty.call(payload ?? {}, 'windowHours')) {
+      settings.windowHours = numberOr(payload.windowHours, settings.windowHours, 1, 720)
+    }
+    this.touch()
+    return { ...settings }
+  }
+
+  /**
+   * Undo the most recent (or named) dream run.
+   * @param {string|undefined} activityId
+   */
+  undoDream(activityId) {
+    const activity = activityId
+      ? this.state.activities.find((entry) => entry.id === activityId)
+      : this.state.activities.find((entry) => entry.undoable && entry.undo)
+    if (!activity) throw new ReminderError('not_found', 'There is no dream run to undo.')
+    if (!activity.undoable || !activity.undo) throw new ReminderError('invalid', 'That dream run cannot be undone.')
+    const restoredItems = activity.undo.items
+      .map(normalizeItem)
+      .filter(Boolean)
+    const restoredGroups = activity.undo.groups
+      .map(normalizeGroup)
+      .filter(Boolean)
+    this.state.items = restoredItems
+    this.state.groups = restoredGroups.length > 0 ? restoredGroups : []
+    ensureDefaultGroup(this.state.groups)
+    const knownGroups = new Set(this.state.groups.map((group) => group.id))
+    const fallback = ensureDefaultGroup(this.state.groups)
+    for (const item of this.state.items) if (!knownGroups.has(item.groupId)) item.groupId = fallback.id
+    activity.undoable = false
+    activity.undone = true
+    this.touch()
+    return this.activityView(activity)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Session scanner (read-only)
+// ---------------------------------------------------------------------------
+
+/** Read-only Session corpus scanner used only by the dreaming engine. */
+class SessionScanner {
+  /** @param {object} ctx */
+  constructor(ctx) {
+    this.ctx = ctx
+  }
+
+  /**
+   * Collect recent Session summaries.
+   * @param {{signal?:AbortSignal, windowHours:number, maxSessions:number, maxCandidates?:number}} options
+   */
+  async scan(options) {
+    const { signal } = options
+    const now = nowMs()
+    const windowHours = options.windowHours
+    const maxSessions = options.maxSessions
+    const maxCandidates = options.maxCandidates ?? 60
+    const query = this.ctx.get('sessionQuery')
+    const persistence = this.ctx.get('sessionPersistence')
+    const sessionsService = this.ctx.get('sessions')
+
+    /** @type {Map<string, any>} */
+    const candidates = new Map()
+
+    let persistedSnapshots = []
+    if (persistence) {
+      try {
+        persistedSnapshots = await persistence.list({ signal })
+      } catch (error) {
+        if (signal?.aborted) throw error
+      }
+    }
+    for (const snapshot of persistedSnapshots) {
+      const header = snapshot?.header
+      if (!header || typeof header.id !== 'string') continue
+      if (header.origin === 'subagent') continue
+      let recency = typeof header.createdAt === 'number' ? header.createdAt : 0
+      const locationPath = snapshot.location?.path
+      if (typeof locationPath === 'string') {
+        try {
+          const stats = await stat(locationPath)
+          if (Number.isFinite(stats.mtimeMs)) recency = Math.max(recency, stats.mtimeMs)
+        } catch {
+          // an unmaterialized or vanishing log keeps its header timestamp
+        }
+      }
+      candidates.set(header.id, {
+        id: header.id,
+        header,
+        live: false,
+        recency,
+        eventCount: typeof snapshot.eventCount === 'number' ? snapshot.eventCount : undefined,
+      })
+    }
+
+    if (sessionsService) {
+      for (const session of sessionsService.list()) {
+        const header = session.header
+        if (!header || typeof header.id !== 'string') continue
+        if (header.origin === 'subagent') continue
+        let lastTime = typeof header.createdAt === 'number' ? header.createdAt : 0
+        try {
+          const last = session.seq > 0 ? session.eventAt(session.seq - 1) : undefined
+          if (last && typeof last.time === 'number') lastTime = Math.max(lastTime, last.time)
+        } catch {
+          // a session with no readable tail keeps its creation time
+        }
+        const previous = candidates.get(header.id)
+        candidates.set(header.id, {
+          id: header.id,
+          header,
+          live: true,
+          session,
+          recency: Math.max(lastTime, previous?.recency ?? 0),
+          eventCount: previous?.eventCount,
+        })
+      }
+    }
+
+    const cutoff = now - windowHours * 3_600_000
+    const ranked = [...candidates.values()]
+      .filter((candidate) => candidate.recency >= cutoff)
+      .sort((a, b) => b.recency - a.recency)
+      .slice(0, maxCandidates)
+
+    // One batched title fold keeps display titles (usually LLM-generated).
+    const titles = new Map()
+    if (query?.readTitleSnapshots && ranked.length > 0) {
+      try {
+        const results = await query.readTitleSnapshots(ranked.map((candidate) => candidate.id), signal)
+        for (const result of results) {
+          if (result.status === 'fulfilled' && result.value?.title?.title) {
+            titles.set(result.sessionId, result.value.title.title)
+          }
+        }
+      } catch (error) {
+        if (signal?.aborted) throw error
+      }
+    }
+
+    const summaries = []
+    for (const candidate of ranked.slice(0, maxSessions)) {
+      signal?.throwIfAborted()
+      try {
+        const summary = await this.describe(candidate, titles.get(candidate.id), signal)
+        if (summary) summaries.push(summary)
+      } catch (error) {
+        if (signal?.aborted) throw error
+      }
+    }
+    return summaries
+  }
+
+  /**
+   * Describe one candidate Session from a first-events + tail-events sample.
+   * The lightweight event index refines turn count and recovers the latest user
+   * request when a long running turn pushed it out of the sampled tail.
+   * @param {any} candidate @param {string|undefined} title @param {AbortSignal|undefined} signal
+   */
+  async describe(candidate, title, signal) {
+    const events = await this.readEvents(candidate, signal)
+    if (events.length === 0) return null
+    const info = analyzeEvents(events)
+    const refined = await this.refine(candidate, info, signal)
+    const displayTitle = title || info.title
+    const hasWork = Boolean(info.firstUserText || refined.lastUserText || displayTitle)
+    if (!hasWork) return null
+    const cwd = typeof candidate.header.cwd === 'string' ? candidate.header.cwd : undefined
+    const summary = {
+      id: candidate.id,
+      title: titleForSession({ title: displayTitle ?? '', firstUserText: info.firstUserText, lastUserText: refined.lastUserText, cwd }),
+      cwd,
+      groupName: groupNameForCwd(cwd),
+      lastActivity: Math.max(candidate.recency ?? 0, info.lastTime ?? 0, refined.lastActivity ?? 0),
+      firstUserText: info.firstUserText,
+      lastUserText: refined.lastUserText,
+      lastAssistantText: info.lastAssistantText,
+      lastError: info.lastError,
+      tools: info.tools,
+      turnEnds: refined.turnEnds,
+      state: refined.state,
+    }
+    return summary
+  }
+
+  /**
+   * Refine sampled facts with `sessionQuery`'s lightweight event index: exact
+   * turn ends, real last event time/state, and the latest user text fetched by
+   * seq when the sample missed it.
+   * @param {any} candidate @param {ReturnType<typeof analyzeEvents>} info @param {AbortSignal|undefined} signal
+   */
+  async refine(candidate, info, signal) {
+    const refined = {
+      turnEnds: info.turnEnds,
+      lastActivity: 0,
+      lastUserText: info.lastUserText,
+      state: info.state,
+    }
+    const query = this.ctx.get('sessionQuery')
+    if (!query || typeof query.listEvents !== 'function') return refined
+    let records
+    try {
+      records = await query.listEvents(candidate.id)
+    } catch (error) {
+      if (signal?.aborted) throw error
+      return refined
+    }
+    if (!Array.isArray(records) || records.length === 0) return refined
+    refined.turnEnds = records.reduce((count, record) => count + (record?.type === 'turn/end' ? 1 : 0), 0)
+    const lastRecord = records[records.length - 1]
+    if (typeof lastRecord?.time === 'number') refined.lastActivity = lastRecord.time
+    if (!refined.lastUserText && typeof query.readEvent === 'function') {
+      for (let index = records.length - 1; index >= 0; index -= 1) {
+        if (records[index]?.type !== 'user/message') continue
+        try {
+          const window = await query.readEvent({ sessionId: candidate.id, seq: records[index].seq })
+          const text = userMessageText(window?.target, 2000)
+          if (text) {
+            refined.lastUserText = text
+            break
+          }
+        } catch (error) {
+          if (signal?.aborted) throw error
+        }
+      }
+    }
+    return refined
+  }
+
+  /**
+   * Read the first and last samples of one Session's event log.
+   * @param {any} candidate @param {AbortSignal|undefined} signal
+   */
+  async readEvents(candidate, signal) {
+    const firstSize = 40
+    const tailSize = 80
+    /** @type {Array<object>} */
+    let first = []
+    /** @type {Array<object>} */
+    let last = []
+
+    if (candidate.live && candidate.session) {
+      const session = candidate.session
+      const total = typeof session.seq === 'number' ? session.seq : 0
+      const firstEnd = Math.min(total, firstSize)
+      for (let seq = 0; seq < firstEnd; seq += 1) {
+        try {
+          const event = session.eventAt(seq)
+          if (event) first.push(event)
+        } catch {
+          break
+        }
+      }
+      const tailStart = Math.max(firstEnd, total - tailSize)
+      for (let seq = tailStart; seq < total; seq += 1) {
+        try {
+          const event = session.eventAt(seq)
+          if (event) last.push(event)
+        } catch {
+          break
+        }
+      }
+      return mergeEvents(first, last)
+    }
+
+    const persistence = this.ctx.get('sessionPersistence')
+    if (!persistence) return []
+    let handle
+    try {
+      handle = await persistence.open(candidate.id, 'read', { signal })
+    } catch {
+      return []
+    }
+    try {
+      const count = typeof candidate.eventCount === 'number' ? candidate.eventCount : undefined
+      const head = await handle.read(0, firstSize, { signal })
+      first = [...head.events]
+      if (typeof count === 'number' && count > firstSize) {
+        const start = Math.max(firstSize, count - tailSize)
+        const tail = await handle.read(start, tailSize, { signal })
+        last = [...tail.events]
+      }
+    } catch (error) {
+      if (signal?.aborted) throw error
+    } finally {
+      try {
+        await handle.close()
+      } catch {
+        // closing a read handle is best effort
+      }
+    }
+    return mergeEvents(first, last)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Dreaming engine
+// ---------------------------------------------------------------------------
+
+/** Dream planning: pure derivation of one run's operations. */
+class DreamEngine {
+  /**
+   * @param {ReminderStore} store @param {object} ctx
+   */
+  constructor(store, ctx) {
+    this.store = store
+    this.ctx = ctx
+    this.scanner = new SessionScanner(ctx)
+    this.current = null
+  }
+
+  get running() {
+    return this.current !== null
+  }
+
+  /**
+   * Run one dreaming pass, serialized against other runs.
+   * @param {{trigger?:string, signal?:AbortSignal}} options
+   */
+  async run(options = {}) {
+    if (this.current) return this.current
+    const promise = this.#run(options).finally(() => {
+      this.current = null
+    })
+    this.current = promise
+    return promise
+  }
+
+  /**
+   * @param {{trigger?:string, signal?:AbortSignal}} options
+   */
+  async #run(options) {
+    const store = this.store
+    await store.ready
+    const state = store.state
+    const settings = state.settings
+    const now = nowMs()
+    const activity = {
+      id: newId('a'),
+      status: 'running',
+      startedAt: now,
+      scanned: 0,
+      created: 0,
+      updated: 0,
+      attention: 0,
+      summary: 'Scanning recent sessions…',
+      undoable: false,
+      undone: false,
+      changes: [],
+      undo: {
+        items: state.items.map((item) => structuredClone(item)),
+        groups: state.groups.map((group) => structuredClone(group)),
+      },
+    }
+    state.activities.unshift(activity)
+    store.pruneActivities()
+    store.engineRunning = true
+    store.touch()
+
+    try {
+      const summaries = await this.scanner.scan({
+        signal: options.signal,
+        windowHours: settings.windowHours,
+        maxSessions: settings.maxSessions,
+      })
+      activity.scanned = summaries.length
+      activity.summary = `Scanned ${summaries.length} session${summaries.length === 1 ? '' : 's'}…`
+      this.#applyPlan(activity, summaries, now)
+      const parts = [`Scanned ${summaries.length} session${summaries.length === 1 ? '' : 's'}`]
+      if (activity.created > 0) parts.push(`${activity.created} new`)
+      if (activity.updated > 0) parts.push(`${activity.updated} updated`)
+      if (activity.attention > 0) parts.push(`${activity.attention} need${activity.attention === 1 ? 's' : ''} attention`)
+      activity.status = 'done'
+      activity.endedAt = nowMs()
+      activity.summary = parts.join(' · ')
+      activity.undoable = activity.created + activity.updated > 0
+      if (!activity.undoable) activity.undo = undefined
+      state.lastDreamAt = activity.endedAt
+      store.touch()
+      await store.persist()
+      return store.activityView(activity)
+    } catch (error) {
+      activity.status = 'error'
+      activity.endedAt = nowMs()
+      activity.error = cleanLine(error instanceof Error ? error.message : String(error), 400)
+      activity.summary = `Dreaming failed: ${activity.error}`
+      activity.undo = undefined
+      state.lastDreamAt = activity.endedAt
+      store.touch()
+      await store.persist()
+      return store.activityView(activity)
+    } finally {
+      store.engineRunning = false
+    }
+  }
+
+  /**
+   * Fold scanned summaries into the reminder list.
+   * @param {object} activity @param {Array<object>} summaries @param {number} now
+   */
+  #applyPlan(activity, summaries, now) {
+    const store = this.store
+    const state = store.state
+    const settings = state.settings
+    const sorted = [...summaries].sort((a, b) => b.lastActivity - a.lastActivity)
+    const createdThisRun = new Set()
+
+    for (const summary of sorted) {
+      if (summary.lastActivity > now + 60_000) continue
+      const groupName = summary.groupName || DEFAULT_GROUP_NAME
+      const group = store.groupForName(groupName).group
+      store.rememberSession(summary)
+
+      let item = this.#matchItem(summary, group.id)
+      if (item) {
+        const changed = this.#updateItemFromSession(item, summary, group.id, now)
+        activity.updated += changed ? 1 : 0
+        if (changed) {
+          activity.changes.push({
+            itemId: item.id,
+            title: item.title,
+            kind: 'updated',
+            detail: summarizeSession(summary, 'updated'),
+          })
+        }
+      } else if (createdThisRun.size < 8) {
+        item = {
+          id: newId('r'),
+          title: titleForSession(summary),
+          notes: cleanLine(summary.lastAssistantText, 300),
+          nextStep: cleanLine(summary.lastUserText, MAX_NEXT_STEP),
+          groupId: group.id,
+          status: summary.state === 'blocked' ? 'blocked' : 'doing',
+          progress: suggestedProgress(summary),
+          importance: 3,
+          pinned: false,
+          source: 'dream',
+          autoManaged: true,
+          sessionIds: [summary.id],
+          createdAt: now,
+          updatedAt: now,
+          lastTouched: summary.lastActivity,
+          lastDreamBatchId: activity.id,
+        }
+        state.items.push(item)
+        createdThisRun.add(item.id)
+        activity.created += 1
+        activity.changes.push({
+          itemId: item.id,
+          title: item.title,
+          kind: 'created',
+          detail: summarizeSession(summary, 'created'),
+        })
+      }
+    }
+
+    // Forgotten-work pass: actively tracked items gone quiet past the threshold.
+    const forgetCutoff = now - settings.forgetHours * 3_600_000
+    for (const item of state.items) {
+      if (item.status !== 'todo' && item.status !== 'doing' && item.status !== 'blocked') continue
+      if (item.lastTouched > forgetCutoff) continue
+      const ageDays = Math.max(1, Math.round((now - item.lastTouched) / 86_400_000))
+      activity.attention += 1
+      activity.changes.push({
+        itemId: item.id,
+        title: item.title,
+        kind: 'attention',
+        detail: `No activity for ${ageDays} day${ageDays === 1 ? '' : 's'}`,
+      })
+    }
+  }
+
+  /**
+   * Find the existing reminder that best represents a Session.
+   * @param {object} summary @param {string} groupId
+   */
+  #matchItem(summary, groupId) {
+    const items = this.store.state.items
+    const linked = items.find((item) => item.sessionIds.includes(summary.id))
+    if (linked) return linked
+    const summaryTokens = tokenize(summary.title)
+    let best
+    let bestScore = 0
+    for (const item of items) {
+      if (item.groupId !== groupId) continue
+      const score = jaccard(summaryTokens, tokenize(item.title))
+      if (score > bestScore) {
+        bestScore = score
+        best = item
+      }
+    }
+    return bestScore >= 0.34 ? best : undefined
+  }
+
+  /**
+   * Merge one Session into an existing item and report whether anything changed.
+   * @param {object} item @param {object} summary @param {string} groupId @param {number} now
+   */
+  #updateItemFromSession(item, summary, groupId, now) {
+    let changed = false
+    if (!item.sessionIds.includes(summary.id)) {
+      item.sessionIds.push(summary.id)
+      changed = true
+    }
+    if (item.groupId !== groupId && this.store.findGroup(groupId)) {
+      item.groupId = groupId
+      changed = true
+    }
+    if (summary.lastActivity > item.lastTouched) {
+      item.lastTouched = summary.lastActivity
+      changed = true
+    }
+    if (item.status !== 'done') {
+      const nextStatus = summary.state === 'blocked' ? 'blocked' : item.status === 'todo' ? 'doing' : item.status
+      if (nextStatus !== item.status) {
+        item.status = nextStatus
+        changed = true
+      }
+      if (item.progress < suggestedProgress(summary)) {
+        item.progress = suggestedProgress(summary)
+        changed = true
+      }
+    }
+    if (summary.lastUserText && !item.nextStep) {
+      item.nextStep = cleanLine(summary.lastUserText, MAX_NEXT_STEP)
+      changed = true
+    }
+    if (summary.lastAssistantText && !item.notes) {
+      item.notes = cleanLine(summary.lastAssistantText, 300)
+      changed = true
+    }
+    if (summary.lastError && item.status !== 'blocked' && item.status !== 'done') {
+      item.status = 'blocked'
+      item.nextStep = summary.lastError
+      changed = true
+    }
+    if (changed) {
+      item.updatedAt = now
+      item.lastDreamBatchId = undefined
+    }
+    return changed
+  }
+}
+
+/** @param {object} summary @param {string} verb */
+function summarizeSession(summary, verb) {
+  const piece = summary.lastUserText
+    ? cleanLine(summary.lastUserText, 110)
+    : cleanLine(summary.title, 110)
+  return piece ? `${verb}: ${piece}` : `${verb}: ${summary.title}`
+}
+
+// ---------------------------------------------------------------------------
+// Action dispatch (shared by HTTP routes and the agent tool)
+// ---------------------------------------------------------------------------
+
+/**
+ * Drop non-JSON values (notably `undefined` object properties) so a tool result
+ * passes the canonical lossless-JSON check. Views build optional fields as
+ * `undefined` for the browser's convenience; the model-facing value must not.
+ * @param {unknown} value
+ */
+function toLosslessJson(value) {
+  if (value === undefined) return null
+  try {
+    return JSON.parse(JSON.stringify(value))
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Normalize an unknown thrown value into the wire error shape.
+ * @param {unknown} error
+ */
+function errorResponse(error) {
+  if (error instanceof ReminderError) return { ok: false, error: { code: error.code, message: error.message } }
+  const message = error instanceof Error ? error.message : String(error)
+  return { ok: false, error: { code: 'internal', message: message.slice(0, 400) } }
+}
+
+/**
+ * Run one user-visible operation.
+ * @param {ReminderStore} store @param {DreamEngine} engine
+ * @param {string} action @param {Record<string, any>} payload
+ * @param {{awaitDream?:boolean, signal?:AbortSignal}} options
+ */
+async function dispatchAction(store, engine, action, payload, options = {}) {
+  await store.ready
+  const input = payload && typeof payload === 'object' ? payload : {}
+  switch (action) {
+    case 'item.create': {
+      const item = store.createItem(input)
+      await store.persist()
+      return { ok: true, value: store.itemView(item) }
+    }
+    case 'item.update': {
+      const item = store.updateItem(input.id, input.patch)
+      await store.persist()
+      return { ok: true, value: store.itemView(item) }
+    }
+    case 'item.delete': {
+      const removed = store.deleteItem(input.id)
+      await store.persist()
+      return { ok: true, value: { id: removed.id } }
+    }
+    case 'group.create': {
+      const group = store.createGroup(input.name)
+      await store.persist()
+      return { ok: true, value: { id: group.id, name: group.name } }
+    }
+    case 'group.rename': {
+      const group = store.renameGroup(input.id, input.name)
+      await store.persist()
+      return { ok: true, value: { id: group.id, name: group.name } }
+    }
+    case 'group.delete': {
+      const result = store.deleteGroup(input.id)
+      await store.persist()
+      return { ok: true, value: result }
+    }
+    case 'settings.update': {
+      const settings = store.updateSettings(input)
+      await store.persist()
+      return { ok: true, value: settings }
+    }
+    case 'dream.run': {
+      if (engine.running) return { ok: true, value: { started: false, busy: true } }
+      if (options.awaitDream) {
+        const activity = await engine.run({ trigger: 'manual', signal: options.signal })
+        return { ok: true, value: activity }
+      }
+      void engine.run({ trigger: 'manual' })
+      return { ok: true, value: { started: true } }
+    }
+    case 'dream.status': {
+      return { ok: true, value: store.snapshot() }
+    }
+    case 'dream.undo': {
+      const activity = store.undoDream(input.activityId)
+      await store.persist()
+      return { ok: true, value: activity }
+    }
+    default:
+      throw new ReminderError('invalid', `Unknown reminder action "${action}".`)
+  }
+}
+
+/**
+ * The agent-facing `reminders` tool.
+ * @param {ReminderStore} store @param {DreamEngine} engine
+ */
+function createRemindersTool(store, engine) {
+  return {
+    name: TOOL_NAME,
+    description:
+      'Maintain the user\'s reminder list of work in progress (the Reminders panel). ' +
+      'Actions: list (grouped snapshot), get (one item), create, update, delete, group_create, ' +
+      'group_delete, dream_run (scan recent Sessions now and fold results in), dream_status, ' +
+      'undo_dream, update_settings. Dreaming may also run automatically; prefer `list` first to ' +
+      'avoid duplicating an item that dreaming already created.',
+    parameters: {
+      type: 'object',
+      properties: {
+        action: {
+          type: 'string',
+          enum: [
+            'list', 'get', 'create', 'update', 'delete', 'group_create', 'group_delete',
+            'dream_run', 'dream_status', 'undo_dream', 'update_settings',
+          ],
+          description: 'Operation to run.',
+        },
+        id: { type: 'string', description: 'Reminder id for get/update/delete, or group id for group_delete.' },
+        title: { type: 'string', description: 'Reminder title for create/update (non-empty, at most 200 chars).' },
+        notes: { type: 'string', description: 'Free-form notes for the reminder.' },
+        nextStep: { type: 'string', description: 'The concrete next step for this work item.' },
+        group: { type: 'string', description: 'Group display name: used by list as a filter and by create as a target group.' },
+        groupId: { type: 'string', description: 'Group id for create/update.' },
+        status: { type: 'string', enum: STATUSES, description: 'Lifecycle status.' },
+        progress: { type: 'integer', description: 'Completion percentage 0-100.' },
+        importance: { type: 'integer', description: 'Importance 1 (low) to 5 (critical).' },
+        pinned: { type: 'boolean', description: 'Pin the item to the top of its group.' },
+        patch: { type: 'object', description: 'Raw update fields for update (same names as above).' },
+        activityId: { type: 'string', description: 'Dream activity to undo; omit for the latest run.' },
+        dreamEnabled: { type: 'boolean', description: 'Turn automatic dreaming on or off.' },
+        dreamIntervalMinutes: { type: 'integer', description: 'Dreaming interval in minutes (1-1440).' },
+        windowHours: { type: 'integer', description: 'How far back to scan Sessions, in hours.' },
+      },
+      required: ['action'],
+      additionalProperties: false,
+    },
+    output: {
+      schema: {
+        type: 'object',
+        properties: {
+          ok: { type: 'boolean' },
+          summary: { type: 'string' },
+          value: {},
+        },
+      },
+      render(_args, value) {
+        const record = value && typeof value === 'object' ? /** @type {Record<string, any>} */ (value) : {}
+        const text = record.summary
+          ? `${record.summary}\n\n${JSON.stringify(record.value ?? null, null, 2)}`
+          : JSON.stringify(value ?? null, null, 2)
+        return [{ type: 'text', text: text.slice(0, 20_000) }]
+      },
+    },
+    async execute(args, exec) {
+      const input = args && typeof args === 'object' ? /** @type {Record<string, any>} */ (args) : {}
+      const action = typeof input.action === 'string' ? input.action : ''
+      try {
+        const result = await toolDispatch(store, engine, action, input, exec?.signal)
+        const summary = result.ok === false
+          ? result.error.message
+          : summarizeToolResult(action, result.value)
+        return { ok: result.ok, summary, value: toLosslessJson(result.ok ? result.value : result.error) }
+      } catch (error) {
+        const failure = errorResponse(error)
+        return { ok: false, summary: failure.error.message, value: toLosslessJson(failure.error) }
+      }
+    },
+  }
+}
+
+/**
+ * Map the flat tool arguments onto the shared action dispatcher.
+ * @param {ReminderStore} store @param {DreamEngine} engine
+ * @param {string} action @param {Record<string, any>} input @param {AbortSignal|undefined} signal
+ */
+async function toolDispatch(store, engine, action, input, signal) {
+  switch (action) {
+    case 'list': {
+      await store.ready
+      const snapshot = store.snapshot()
+      const groupName = typeof input.group === 'string' ? groupKey(input.group) : ''
+      const groups = snapshot.groups
+      const items = snapshot.items
+        .filter((item) => (!groupName || groupKey(groups.find((group) => group.id === item.groupId)?.name ?? '') === groupName))
+        .map((item) => ({
+          id: item.id,
+          title: item.title,
+          group: groups.find((group) => group.id === item.groupId)?.name ?? DEFAULT_GROUP_NAME,
+          status: item.status,
+          progress: item.progress,
+          importance: item.importance,
+          freshness: item.freshness,
+          pinned: item.pinned,
+          nextStep: item.nextStep,
+          sessionIds: item.sessionIds,
+          lastTouched: item.lastTouched,
+        }))
+      return { ok: true, value: { groups, items, dream: snapshot.dream, count: items.length } }
+    }
+    case 'get': {
+      await store.ready
+      const item = store.state.items.find((entry) => entry.id === input.id)
+      if (!item) throw new ReminderError('not_found', 'That reminder no longer exists.')
+      return { ok: true, value: store.itemView(item) }
+    }
+    case 'create': {
+      return dispatchAction(store, engine, 'item.create', {
+        title: input.title,
+        notes: input.notes,
+        nextStep: input.nextStep,
+        group: input.group,
+        groupId: input.groupId,
+        status: input.status,
+        progress: input.progress,
+        importance: input.importance,
+        pinned: input.pinned,
+      })
+    }
+    case 'update': {
+      const patch = { ...(input.patch && typeof input.patch === 'object' ? input.patch : {}) }
+      for (const key of ['title', 'notes', 'nextStep', 'groupId', 'status', 'progress', 'importance', 'pinned']) {
+        if (Object.prototype.hasOwnProperty.call(input, key)) patch[key] = input[key]
+      }
+      return dispatchAction(store, engine, 'item.update', { id: input.id, patch })
+    }
+    case 'delete':
+      return dispatchAction(store, engine, 'item.delete', { id: input.id })
+    case 'group_create':
+      return dispatchAction(store, engine, 'group.create', { name: input.group ?? input.title })
+    case 'group_delete':
+      return dispatchAction(store, engine, 'group.delete', { id: input.id })
+    case 'dream_run':
+      await store.ready
+      if (engine.running) return { ok: true, value: { started: false, busy: true } }
+      return dispatchAction(store, engine, 'dream.run', {}, { awaitDream: true, signal })
+    case 'dream_status': {
+      await store.ready
+      return { ok: true, value: store.snapshot().dream }
+    }
+    case 'undo_dream':
+      return dispatchAction(store, engine, 'dream.undo', { activityId: input.activityId })
+    case 'update_settings':
+      return dispatchAction(store, engine, 'settings.update', {
+        dreamEnabled: input.dreamEnabled,
+        dreamIntervalMinutes: input.dreamIntervalMinutes,
+        windowHours: input.windowHours,
+      })
+    default:
+      throw new ReminderError('invalid', `Unknown action "${action}". Use list, get, create, update, delete, group_create, group_delete, dream_run, dream_status, undo_dream, update_settings.`)
+  }
+}
+
+/** @param {string} action @param {any} value */
+function summarizeToolResult(action, value) {
+  switch (action) {
+    case 'list': {
+      const items = Array.isArray(value?.items) ? value.items : []
+      const groups = Array.isArray(value?.groups) ? value.groups : []
+      return `Reminder list: ${items.length} item${items.length === 1 ? '' : 's'} in ${groups.length} group${groups.length === 1 ? '' : 's'}.`
+    }
+    case 'create':
+      return `Created reminder "${value?.title ?? ''}".`
+    case 'update':
+      return `Updated reminder "${value?.title ?? ''}".`
+    case 'delete':
+      return 'Deleted the reminder.'
+    case 'group_create':
+    case 'group_rename':
+      return `Group "${value?.name ?? ''}" is ready.`
+    case 'group_delete':
+      return 'Deleted the group; its items moved to the default group.'
+    case 'dream_run': {
+      if (value?.busy) return 'A dreaming pass is already running.'
+      return `Dreaming finished: ${value?.summary ?? 'no summary'}.`
+    }
+    case 'dream_status':
+      return 'Current dreaming status.'
+    case 'undo_dream':
+      return 'Undid the dreaming run.'
+    case 'update_settings':
+      return 'Updated dreaming settings.'
+    default:
+      return 'Done.'
+  }
+}
+
+// ---------------------------------------------------------------------------
+// HTTP route handlers (pure over store + engine, so they are unit-testable)
+// ---------------------------------------------------------------------------
+
+/**
+ * Answer `GET|HEAD /api/dsh-reminders/state`.
+ * @param {ReminderStore} store @param {Request} request
+ */
+async function serveStateRequest(store, request) {
+  try {
+    await store.ready
+    if (request.method === 'HEAD') return new Response(null, { status: 200, headers: noStoreHeaders() })
+    return jsonResponse(store.snapshot())
+  } catch (error) {
+    return jsonResponse(errorResponse(error), 500)
+  }
+}
+
+/**
+ * Answer `POST /api/dsh-reminders/action`.
+ * @param {ReminderStore} store @param {DreamEngine} engine @param {Request} request
+ */
+async function serveActionRequest(store, engine, request) {
+  try {
+    await store.ready
+    let body
+    try {
+      body = await request.json()
+    } catch {
+      throw new ReminderError('invalid', 'Request body must be JSON.')
+    }
+    const action = body && typeof body.action === 'string' ? body.action : ''
+    const result = await dispatchAction(store, engine, action, body?.payload ?? {})
+    return jsonResponse(result)
+  } catch (error) {
+    return jsonResponse(errorResponse(error))
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Config and plugin entry
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolve bundle-row config into runtime defaults.
+ * @param {Record<string, any>} config
+ */
+function resolveConfig(config) {
+  const raw = config && typeof config === 'object' ? config : {}
+  return {
+    dreamEnabled: boolOr(raw.dreamEnabled, true),
+    dreamIntervalMinutes: numberOr(raw.dreamIntervalMinutes, 10, 1, 1440),
+    windowHours: numberOr(raw.windowHours, 72, 1, 720),
+    staleHours: numberOr(raw.staleHours, 24, 1, 720),
+    forgetHours: numberOr(raw.forgetHours, 72, 1, 2160),
+    maxSessions: numberOr(raw.maxSessions, 12, 1, 50),
+    dataDir: typeof raw.dataDir === 'string' && raw.dataDir.trim().length > 0
+      ? raw.dataDir.trim()
+      : (typeof process.env.DSH_REMINDERS_DIR === 'string' && process.env.DSH_REMINDERS_DIR.trim().length > 0
+        ? process.env.DSH_REMINDERS_DIR.trim()
+        : join(typeof process.env.DSH_HOME === 'string' && process.env.DSH_HOME.trim().length > 0 ? process.env.DSH_HOME.trim() : join(homedir(), '.dsh'), 'reminders')),
+  }
+}
+
+/**
+ * Host plugin entry.
+ * @param {object} ctx
+ * @param {Record<string, any>} config
+ */
+export function apply(ctx, config) {
+  const resolved = resolveConfig(config)
+  const store = new ReminderStore(resolved.dataDir, resolved)
+  const engine = new DreamEngine(store, ctx)
+  store.ready.catch((error) => {
+    ctx.logger?.warn?.(`reminders: state load failed: ${error instanceof Error ? error.message : String(error)}`)
+  })
+
+  const log = (message) => {
+    try {
+      ctx.logger?.warn?.(message)
+    } catch {
+      // logging must never break the plugin
+    }
+  }
+
+  // The agent tool keeps the reminder list editable from a conversation too.
+  ctx.effect(() => ctx.tools.register(createRemindersTool(store, engine)), 'reminders: agent tool')
+
+  // Authenticated browser routes: GET state, POST action.
+  ctx.inject(['connection'], (scope) => {
+    scope.effect(() => {
+      const disposeState = scope.connection.fetch.register({
+        path: ROUTE_STATE,
+        methods: ['GET', 'HEAD'],
+        requestBody: 'buffered',
+        fetch: (request) => serveStateRequest(store, request),
+      })
+      const disposeAction = scope.connection.fetch.register({
+        path: ROUTE_ACTION,
+        methods: ['POST'],
+        requestBody: 'buffered',
+        fetch: (request) => serveActionRequest(store, engine, request),
+      })
+      return () => {
+        try {
+          disposeState()
+        } catch {
+          // already disposed
+        }
+        try {
+          disposeAction()
+        } catch {
+          // already disposed
+        }
+      }
+    }, 'reminders: api routes')
+  })
+
+  // Dreaming schedule: one lightweight tick; the interval itself is configurable
+  // at runtime, so the tick compares against the persisted last-run timestamp.
+  ctx.effect(() => {
+    let disposed = false
+    const tick = async () => {
+      if (disposed) return
+      try {
+        await store.ready
+        if (disposed) return
+        const settings = store.state.settings
+        if (!settings.dreamEnabled || engine.running) return
+        const last = store.state.lastDreamAt || 0
+        const due = last === 0 ? 12_000 : last + settings.dreamIntervalMinutes * 60_000
+        if (nowMs() < due) return
+        await engine.run({ trigger: 'auto' })
+      } catch (error) {
+        log(`reminders: dreaming tick failed: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+    const timer = setInterval(() => {
+      void tick()
+    }, 15_000)
+    const warmup = setTimeout(() => {
+      void tick()
+    }, 10_000)
+    return () => {
+      disposed = true
+      clearInterval(timer)
+      clearTimeout(warmup)
+    }
+  }, 'reminders: dreaming timer')
+}
+
+/** @param {unknown} value @param {number} status */
+function jsonResponse(value, status = 200) {
+  return new Response(JSON.stringify(value), {
+    status,
+    headers: {
+      'content-type': 'application/json; charset=utf-8',
+      ...noStoreHeaders(),
+    },
+  })
+}
+
+function noStoreHeaders() {
+  return { 'cache-control': 'no-store' }
+}
+
+export {
+  ReminderStore,
+  DreamEngine,
+  SessionScanner,
+  dispatchAction,
+  analyzeEvents,
+  deriveFreshness,
+  jaccard,
+  tokenize,
+  groupKey,
+  serveStateRequest,
+  serveActionRequest,
+  toLosslessJson,
+}

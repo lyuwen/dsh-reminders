@@ -52,6 +52,9 @@ window.__ModuleLoader__.load({
       'config.on': 'on',
       'config.off': 'off',
       'config.intro': 'Settings for the dreaming mode that maintains this reminder list. Changes save immediately and persist in the plugin state file.',
+      'config.model': 'Model',
+      'config.modelHint': 'Dreaming is deterministic: it scans Session metadata and titles, not prompts through a model.',
+      'config.modelNone': 'None used · zero tokens',
       'config.dreamEnabled': 'Dreaming mode',
       'config.dreamEnabledHint': 'Scan recent Sessions automatically on a timer.',
       'config.interval': 'Scan interval',
@@ -198,6 +201,9 @@ window.__ModuleLoader__.load({
       'config.on': '已开启',
       'config.off': '已关闭',
       'config.intro': '这是维护提醒清单的梦境模式设置。修改会立即保存，并写入插件的状态文件。',
+      'config.model': '模型',
+      'config.modelHint': '梦境模式是确定性的：只扫描会话元数据与标题，不会把内容发给模型。',
+      'config.modelNone': '不使用模型 · 零 token',
       'config.dreamEnabled': '梦境模式',
       'config.dreamEnabledHint': '按定时器自动扫描最近使用的会话。',
       'config.interval': '扫描间隔',
@@ -2117,6 +2123,9 @@ window.__ModuleLoader__.load({
       }
       body.push(h('p', { key: 'intro', className: 'dshr-configIntro' }, t('config.intro')));
       body.push(h('div', { key: 'rows', className: 'dshr-configRows' },
+        h(ConfigRow, { label: t('config.model'), hint: t('config.modelHint') },
+          h('span', { className: 'dshr-configInfo' }, t('config.modelNone'))
+        ),
         h(ConfigRow, { label: t('config.dreamEnabled'), hint: t('config.dreamEnabledHint') },
           h('button', {
             type: 'button',
@@ -2265,6 +2274,7 @@ window.__ModuleLoader__.load({
       .dshr-configFoot code{font-family:inherit;overflow-wrap:anywhere}
       .dshr-configSaved{color:var(--dsw-alias-state-success-primary)}
       .dshr-configSummary{font-size:13px;line-height:20px;color:var(--dsw-alias-label-secondary)}
+      .dshr-configInfo{max-width:190px;text-align:right;font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary)}
       .dshr-detail{display:flex;flex-direction:column;flex:0 0 380px;min-width:0;min-height:0;border-left:.5px solid var(--dsw-alias-border-l4);background:var(--dsw-alias-bg-base)}
       .dshr-detailBody{display:flex;flex-direction:column;flex:1;min-width:0;min-height:0}
       .dshr-detailHeader{display:flex;align-items:center;gap:8px;flex:none;padding:14px 20px;border-bottom:.5px solid var(--dsw-alias-border-l3)}

@@ -278,9 +278,10 @@ locale: 'reminders' }`. The occupant receives `{ view: 'summary' | 'page' }`; re
 a one-line summary for `summary` and the settings form for `page`. Registering this
 key is what makes the Plugins-page row expose its **Configure** control. The form
 covers dreaming on/off, scan interval, recent window, Sessions per pass, stale-after
-and forgotten-after thresholds, auto-saves through `settings.update`, and shows the
-state directory from `stateDir`. It relies on the plugin's own API, not on an
-exported `Config` schema.
+and forgotten-after thresholds, auto-saves through `settings.update`, shows the
+state directory from `stateDir`, and includes a static **Model: none** row explaining
+that dreaming is deterministic (no LLM calls; Session titles come from DSH's title
+provider). It relies on the plugin's own API, not on an exported `Config` schema.
 
 ### 4. `RemindersIcon` (sidebar.panellist)
 

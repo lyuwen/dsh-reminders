@@ -117,6 +117,13 @@ that schema — the bundle contributes its own row config page.
 - **`cordis.patch.yml`**: bootstrap defaults only; useful for a fresh profile or for
   keys with no UI control (`dataDir`).
 
+The configure page also states it explicitly: **dreaming uses no model** (deterministic,
+zero tokens). The only model involvement is the Session **title text**, produced by
+DSH's own title provider (`session-title-llm`): unless that row sets an explicit
+`provider`/`model` pair, it follows the provider/model route captured by each Session,
+so titles may come from whichever model that Session used. Our plugin only reads the
+resulting title; it never calls a model and has no model selection of its own.
+
 ## Layout
 
 ```text

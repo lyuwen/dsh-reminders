@@ -125,3 +125,31 @@ test('unseenFeed counts distinct attention items, not one per dreaming pass', ()
   assert.equal(feed.activity.created, 0)
   assert.equal(feed.activity.updated, 0)
 })
+
+test('readSeenAt parses the persisted string watermark', () => {
+  const factory = new Function(`const SEEN_KEY = 'dshr:lastSeenAt';\n${extract('readSeenAt')}\nreturn readSeenAt;`)
+  const readSeenAt = factory()
+  globalThis.localStorage = { getItem: () => '1794892434541' }
+  try {
+    assert.equal(readSeenAt(), 1794892434541)
+    globalThis.localStorage = { getItem: () => null }
+    assert.equal(readSeenAt(), 0)
+    globalThis.localStorage = { getItem: () => 'not-a-number' }
+    assert.equal(readSeenAt(), 0)
+  } finally {
+    delete globalThis.localStorage
+  }
+})
+
+test('unseenFeed ignores automatic passes that changed nothing', () => {
+  const noop = { id: 'a0', status: 'done', trigger: 'auto', startedAt: 1000, endedAt: 2000, created: 0, updated: 0, attention: 0, changes: [] }
+  const hidden = unseenFeed({ dream: { activity: noop, rollup: null }, activities: [noop] }, 0)
+  assert.equal(hidden.activity, null)
+  // A manual run still reports "found nothing", and an error is always surfaced.
+  assert.equal(unseenFeed({ dream: { activity: { ...noop, trigger: 'manual' }, rollup: null }, activities: [{ ...noop, trigger: 'manual' }] }, 0).activity.id, 'a0')
+  const failed = { ...noop, status: 'error', error: 'boom' }
+  assert.equal(unseenFeed({ dream: { activity: failed, rollup: null }, activities: [failed] }, 0).activity.id, 'a0')
+  // A rollup made only of no-op passes is not surfaced either.
+  const emptyRollup = { startedAt: 1, endedAt: 2, runs: 20, created: 0, updated: 0, attention: 0, changes: [] }
+  assert.equal(unseenFeed({ dream: { activity: null, rollup: emptyRollup }, activities: [] }, 0).activity, null)
+})

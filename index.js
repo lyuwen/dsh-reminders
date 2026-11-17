@@ -643,6 +643,7 @@ function normalizeActivity(raw) {
   return {
     id: value.id,
     status: value.status === 'done' ? 'done' : value.status === 'error' ? 'error' : 'running',
+    trigger: typeof value.trigger === 'string' ? cleanLine(value.trigger, 20) : 'auto',
     startedAt: numberOr(value.startedAt, nowMs(), 0, Number.MAX_SAFE_INTEGER),
     endedAt: typeof value.endedAt === 'number' ? value.endedAt : undefined,
     scanned: numberOr(value.scanned, 0, 0, 10_000),
@@ -1771,6 +1772,7 @@ class DreamEngine {
     const activity = {
       id: newId('a'),
       status: 'running',
+      trigger: typeof options.trigger === 'string' && options.trigger.length > 0 ? cleanLine(options.trigger, 20) : 'auto',
       startedAt: now,
       scanned: 0,
       created: 0,

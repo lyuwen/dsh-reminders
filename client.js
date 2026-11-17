@@ -894,8 +894,11 @@ window.__ModuleLoader__.load({
     function readSeenAt() {
       try {
         if (typeof localStorage === 'undefined') return 0;
-        const value = num(localStorage.getItem(SEEN_KEY), 0);
-        return value > 0 ? value : 0;
+        const raw = localStorage.getItem(SEEN_KEY);
+        // localStorage returns a string; Number() is required here (num() only
+        // accepts numbers, which previously kept the watermark pinned at 0).
+        const value = raw === null ? 0 : Number(raw);
+        return Number.isFinite(value) && value > 0 ? value : 0;
       } catch (_error) {
         return 0;
       }
@@ -930,7 +933,10 @@ window.__ModuleLoader__.load({
       if (running && str(running.id) !== str(suppressedRunningId)) return { running: running, activity: null };
       const candidates = [];
       const rollup = dream && isObject(dream.rollup) ? dream.rollup : null;
-      if (rollup && num(rollup.endedAt, 0) > seenAt) {
+      const rollupMeaningful = rollup
+        && (num(rollup.created, 0) + num(rollup.updated, 0) + num(rollup.attention, 0) > 0
+          || (Array.isArray(rollup.changes) && rollup.changes.length > 0));
+      if (rollup && rollupMeaningful && num(rollup.endedAt, 0) > seenAt) {
         candidates.push({ record: rollup, runs: Math.max(1, num(rollup.runs, 1)) });
       }
       const activities = data && Array.isArray(data.activities) ? data.activities.filter(isObject) : [];
@@ -938,7 +944,14 @@ window.__ModuleLoader__.load({
         if (activity.undone === true) continue;
         if (str(activity.status) === 'running') continue;
         const endedAt = num(activity.endedAt, num(activity.startedAt, 0));
-        if (endedAt > seenAt) candidates.push({ record: activity, runs: 1 });
+        if (!(endedAt > seenAt)) continue;
+        const meaningful = num(activity.created, 0) + num(activity.updated, 0) + num(activity.attention, 0) > 0
+          || str(activity.error) !== ''
+          || str(activity.trigger) === 'manual';
+        // An automatic pass that changed nothing should not pop up; otherwise the
+        // timer would surface an empty notification every interval.
+        if (!meaningful) continue;
+        candidates.push({ record: activity, runs: 1 });
       }
       if (candidates.length === 0) return { running: null, activity: null };
       candidates.sort(function oldestFirst(left, right) {
@@ -2001,7 +2014,9 @@ window.__ModuleLoader__.load({
           num(activity.startedAt, 0)
         );
         writeSeenAt(seenThrough);
-        setSeenAt(readSeenAt());
+        setSeenAt(function advance(current) {
+          return Math.max(current, Math.floor(seenThrough));
+        });
       };
 
       React.useEffect(function resetOnActivityChange() {

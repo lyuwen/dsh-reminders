@@ -50,8 +50,10 @@ prioritize it.
   affected items with **Edit** / **Delete** per row, **Undo** for the run, **Open
   list**, and **Dismiss**. A top-edge progress bar is indeterminate while running,
   then counts down (12 s) and the popup fades. The countdown pauses on hover, on
-  keyboard focus, and while the page/window loses focus. Notifications never stack:
-  runs completed while the page was unfocused are collapsed into one aggregated
+  keyboard focus, and while the page/window loses focus. An automatic pass that
+  changed nothing does not notify at all, and the last-seen watermark is persisted, so
+  only genuinely new work (or a manual "Dream now") brings the popup back. Notifications
+  never stack: runs completed while the page was unfocused are collapsed into one aggregated
   **While you were away** popup, built from a Host-side activity rollup and the
   last-seen watermark. Its line reads as *N dreaming passes since you last checked ·
   X new reminders · Y grading updates · Z need your attention*: `N` is the number of

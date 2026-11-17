@@ -554,6 +554,7 @@ test('model evaluation grades a session, caches the summary, and labels the acti
   const engine = new DreamEngine(store, ctx)
   const activity = await engine.run({ trigger: 'test' })
   assert.equal(activity.status, 'done')
+  assert.equal(activity.trigger, 'test')
   assert.equal(activity.model, 'fake-provider/fake-model')
   assert.equal(activity.degraded, false)
   assert.equal(activity.evaluated, 1)

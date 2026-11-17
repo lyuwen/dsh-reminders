@@ -48,6 +48,29 @@ window.__ModuleLoader__.load({
       'dream.running': 'Dreaming…',
       'dream.toggleFailed': 'Could not change dreaming: {message}',
       'dream.intervalFailed': 'Could not change the interval: {message}',
+      'config.summary': 'Dreaming {status} · every {interval} min · scans {window} h · {sessions} sessions',
+      'config.on': 'on',
+      'config.off': 'off',
+      'config.intro': 'Settings for the dreaming mode that maintains this reminder list. Changes save immediately and persist in the plugin state file.',
+      'config.dreamEnabled': 'Dreaming mode',
+      'config.dreamEnabledHint': 'Scan recent Sessions automatically on a timer.',
+      'config.interval': 'Scan interval',
+      'config.intervalHint': 'Minutes between automatic dreaming passes.',
+      'config.window': 'Recent window',
+      'config.windowHint': 'Only Sessions touched within this many hours are scanned.',
+      'config.maxSessions': 'Sessions per pass',
+      'config.maxSessionsHint': 'How many recent Sessions are deep-read each pass.',
+      'config.staleHours': 'Stale after',
+      'config.staleHoursHint': 'Freshness turns stale after this many hours without activity.',
+      'config.forgetHours': 'Forgotten after',
+      'config.forgetHoursHint': 'The popup flags work with no activity for this many hours.',
+      'config.stateDir': 'State directory',
+      'config.autoSave': 'Changes save automatically.',
+      'config.saved': 'Saved',
+      'config.saveFailed': 'Could not save settings: {message}',
+      'config.unavailable': 'Settings are unavailable until the reminders Host responds.',
+      'config.hours': '{n} h',
+      'config.sessions': '{n}',
       'dream.runFailed': 'Could not start dreaming: {message}',
       'search.placeholder': 'Search reminders',
       'search.label': 'Search reminders',
@@ -171,6 +194,29 @@ window.__ModuleLoader__.load({
       'dream.running': '正在扫描…',
       'dream.toggleFailed': '无法切换梦境模式：{message}',
       'dream.intervalFailed': '无法修改扫描间隔：{message}',
+      'config.summary': '梦境模式{status} · 每 {interval} 分钟 · 扫描 {window} 小时 · {sessions} 个会话',
+      'config.on': '已开启',
+      'config.off': '已关闭',
+      'config.intro': '这是维护提醒清单的梦境模式设置。修改会立即保存，并写入插件的状态文件。',
+      'config.dreamEnabled': '梦境模式',
+      'config.dreamEnabledHint': '按定时器自动扫描最近使用的会话。',
+      'config.interval': '扫描间隔',
+      'config.intervalHint': '两次自动扫描之间的分钟数。',
+      'config.window': '最近时间窗',
+      'config.windowHint': '仅扫描在此小时数内被访问过的会话。',
+      'config.maxSessions': '每次扫描会话数',
+      'config.maxSessionsHint': '每轮深入读取的最近会话数量。',
+      'config.staleHours': '转为较久',
+      'config.staleHoursHint': '无活动超过该小时数后，新鲜度变为「较久」。',
+      'config.forgetHours': '转为遗忘',
+      'config.forgetHoursHint': '无活动超过该小时数后，弹窗会提示需要关注。',
+      'config.stateDir': '状态目录',
+      'config.autoSave': '修改会自动保存。',
+      'config.saved': '已保存',
+      'config.saveFailed': '无法保存设置：{message}',
+      'config.unavailable': '提醒服务未响应，暂时无法读取设置。',
+      'config.hours': '{n} 小时',
+      'config.sessions': '{n}',
       'dream.runFailed': '无法启动扫描：{message}',
       'search.placeholder': '搜索提醒',
       'search.label': '搜索提醒',
@@ -1963,6 +2009,172 @@ window.__ModuleLoader__.load({
     }
 
     // -------------------------------------------------------------------
+    // Plugin row configuration (Plugin Manager -> Plugins -> reminders row)
+    // -------------------------------------------------------------------
+    const CONFIG_INTERVALS = [1, 5, 10, 15, 30, 60];
+    const CONFIG_WINDOWS = [24, 48, 72, 168, 336];
+    const CONFIG_MAX_SESSIONS = [6, 12, 20, 30];
+    const CONFIG_STALE = [12, 24, 48, 72];
+    const CONFIG_FORGET = [48, 72, 120, 168, 336];
+
+    /** Include the current value even when it is not one of the presets. */
+    function presetOptions(values, current) {
+      if (values.indexOf(current) >= 0) return values;
+      return values.concat([current]).sort(function ascending(left, right) {
+        return left - right;
+      });
+    }
+
+    function ConfigRow(props) {
+      return h('div', { className: 'dshr-configRow' },
+        h('div', { className: 'dshr-configText' },
+          h('span', { className: 'dshr-configLabel' }, props.label),
+          props.hint ? h('span', { className: 'dshr-configHint' }, props.hint) : null
+        ),
+        h('div', { className: 'dshr-configControl' }, props.children)
+      );
+    }
+
+    function RemindersConfig(props) {
+      const t = translatorOf(props);
+      const snapshot = React.useSyncExternalStore(subscribeStore, getSnapshot);
+      const [saving, setSaving] = React.useState('');
+      const [saved, setSaved] = React.useState(false);
+      const [error, setError] = React.useState(null);
+      const data = isObject(snapshot.data) ? snapshot.data : null;
+      const settings = data && isObject(data.settings) ? data.settings : null;
+      const stateDir = data ? str(data.stateDir) : '';
+      const summaryOnly = Boolean(props && props.view === 'summary');
+
+      const save = function save(patch, key) {
+        if (saving !== '') return;
+        setSaving(key);
+        setSaved(false);
+        setError(null);
+        Promise.resolve()
+          .then(function run() {
+            return postAction('settings.update', patch);
+          })
+          .then(function reload() {
+            return refresh();
+          })
+          .then(function done() {
+            setSaved(true);
+          })
+          .catch(function failed(saveError) {
+            setError(t('config.saveFailed', { message: messageOf(saveError) || t('error.unknown') }));
+          })
+          .finally(function settle() {
+            setSaving('');
+          });
+      };
+
+      if (summaryOnly) {
+        if (!settings) return h('span', { className: 'dshr-configSummary' }, t('config.unavailable'));
+        return h('span', { className: 'dshr-configSummary' },
+          t('config.summary', {
+            status: settings.dreamEnabled === true ? t('config.on') : t('config.off'),
+            interval: clampInt(settings.dreamIntervalMinutes, 1, 1440, 10),
+            window: clampInt(settings.windowHours, 1, 720, 72),
+            sessions: clampInt(settings.maxSessions, 1, 50, 12),
+          })
+        );
+      }
+
+      const dreamEnabled = settings ? settings.dreamEnabled === true : true;
+      const interval = settings ? clampInt(settings.dreamIntervalMinutes, 1, 1440, 10) : 10;
+      const windowHours = settings ? clampInt(settings.windowHours, 1, 720, 72) : 72;
+      const maxSessions = settings ? clampInt(settings.maxSessions, 1, 50, 12) : 12;
+      const staleHours = settings ? clampInt(settings.staleHours, 1, 720, 24) : 24;
+      const forgetHours = settings ? clampInt(settings.forgetHours, 1, 2160, 72) : 72;
+      const disabled = saving !== '' || !settings;
+
+      const numberSelect = function numberSelect(key, value, options, format, patch) {
+        return h('select', {
+          key: key,
+          className: 'dshr-select dshr-configSelect',
+          'aria-label': key,
+          disabled: disabled,
+          value: String(value),
+          onChange: function onChange(event) {
+            const next = Number(event.target.value);
+            if (isFinite(next) && next !== value) save(patch(next), key);
+          },
+        }, presetOptions(options, value).map(function renderOption(option) {
+          return h('option', { key: String(option), value: String(option) }, format(option));
+        }));
+      };
+
+      const body = [];
+      if (!data) {
+        body.push(h('div', { key: 'unavailable', className: 'dshr-notice dshr-notice--error' },
+          h('p', null, t('config.unavailable')),
+          h('button', { type: 'button', className: 'dshr-btn dshr-btn--small', onClick: function retry() { refresh(); } }, t('action.retry'))
+        ));
+      }
+      if (error) {
+        body.push(h('p', { key: 'error', className: 'dshr-notice dshr-notice--error', role: 'alert' }, error));
+      }
+      body.push(h('p', { key: 'intro', className: 'dshr-configIntro' }, t('config.intro')));
+      body.push(h('div', { key: 'rows', className: 'dshr-configRows' },
+        h(ConfigRow, { label: t('config.dreamEnabled'), hint: t('config.dreamEnabledHint') },
+          h('button', {
+            type: 'button',
+            className: 'dshr-toggle' + (dreamEnabled ? ' dshr-toggle--on' : ''),
+            role: 'switch',
+            'aria-checked': dreamEnabled ? 'true' : 'false',
+            'aria-label': t('config.dreamEnabled'),
+            disabled: disabled,
+            onClick: function toggle() {
+              if (!disabled) save({ dreamEnabled: !dreamEnabled }, 'dreamEnabled');
+            },
+          }, h('span', { className: 'dshr-toggleKnob', 'aria-hidden': 'true' }))
+        ),
+        h(ConfigRow, { label: t('config.interval'), hint: t('config.intervalHint') },
+          numberSelect('interval', interval, CONFIG_INTERVALS, function minutes(value) {
+            return t('time.minutes', { n: value });
+          }, function patchInterval(value) {
+            return { dreamIntervalMinutes: value };
+          })
+        ),
+        h(ConfigRow, { label: t('config.window'), hint: t('config.windowHint') },
+          numberSelect('window', windowHours, CONFIG_WINDOWS, function hours(value) {
+            return t('config.hours', { n: value });
+          }, function patchWindow(value) {
+            return { windowHours: value };
+          })
+        ),
+        h(ConfigRow, { label: t('config.maxSessions'), hint: t('config.maxSessionsHint') },
+          numberSelect('sessions', maxSessions, CONFIG_MAX_SESSIONS, function sessions(value) {
+            return t('config.sessions', { n: value });
+          }, function patchSessions(value) {
+            return { maxSessions: value };
+          })
+        ),
+        h(ConfigRow, { label: t('config.staleHours'), hint: t('config.staleHoursHint') },
+          numberSelect('stale', staleHours, CONFIG_STALE, function hours(value) {
+            return t('config.hours', { n: value });
+          }, function patchStale(value) {
+            return { staleHours: value };
+          })
+        ),
+        h(ConfigRow, { label: t('config.forgetHours'), hint: t('config.forgetHoursHint') },
+          numberSelect('forget', forgetHours, CONFIG_FORGET, function hours(value) {
+            return t('config.hours', { n: value });
+          }, function patchForget(value) {
+            return { forgetHours: value };
+          })
+        )
+      ));
+      const foot = [];
+      if (saved && !error) foot.push(h('span', { key: 'saved', className: 'dshr-configSaved' }, t('config.saved')));
+      foot.push(h('span', { key: 'auto' }, t('config.autoSave')));
+      if (stateDir) foot.push(h('span', { key: 'dir' }, t('config.stateDir') + ': ', h('code', null, stateDir)));
+      body.push(h('p', { key: 'foot', className: 'dshr-configFoot' }, foot));
+      return h('div', { className: 'dshr-config' }, body);
+    }
+
+    // -------------------------------------------------------------------
     // Styles (single global style tag under the dshr- prefix)
     // -------------------------------------------------------------------
     const STYLE_TEXT = `
@@ -2039,6 +2251,20 @@ window.__ModuleLoader__.load({
       .dshr-notice p{flex:1;min-width:0;margin:0}
       .dshr-notice--error{border-color:var(--dsw-alias-state-error-primary);color:var(--dsw-alias-state-error-primary)}
       .dshr-loading{display:flex;align-items:center;gap:8px;padding:40px 8px;color:var(--dsw-alias-label-tertiary);font-size:13px}
+      .dshr-config{display:flex;flex-direction:column;gap:12px}
+      .dshr-configIntro{margin:0;font-size:13px;line-height:20px;color:var(--dsw-alias-label-tertiary)}
+      .dshr-configRows{display:flex;flex-direction:column;padding:0 14px;border:.5px solid var(--dsw-alias-border-l3);border-radius:16px}
+      .dshr-configRow{display:flex;align-items:center;justify-content:space-between;gap:16px;min-height:46px;padding:8px 0;border-bottom:.5px solid var(--dsw-alias-border-l3)}
+      .dshr-configRow:last-child{border-bottom:0}
+      .dshr-configText{display:flex;flex-direction:column;gap:1px;min-width:0}
+      .dshr-configLabel{font-size:13px;font-weight:500;line-height:20px;color:var(--dsw-alias-label-primary)}
+      .dshr-configHint{font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary)}
+      .dshr-configControl{flex:none;display:flex;align-items:center;gap:8px}
+      .dshr-configSelect{width:auto;min-width:104px;height:28px;font-size:12px}
+      .dshr-configFoot{display:flex;flex-wrap:wrap;gap:4px 12px;margin:0;font-size:12px;line-height:18px;color:var(--dsw-alias-label-caption)}
+      .dshr-configFoot code{font-family:inherit;overflow-wrap:anywhere}
+      .dshr-configSaved{color:var(--dsw-alias-state-success-primary)}
+      .dshr-configSummary{font-size:13px;line-height:20px;color:var(--dsw-alias-label-secondary)}
       .dshr-detail{display:flex;flex-direction:column;flex:0 0 380px;min-width:0;min-height:0;border-left:.5px solid var(--dsw-alias-border-l4);background:var(--dsw-alias-bg-base)}
       .dshr-detailBody{display:flex;flex-direction:column;flex:1;min-width:0;min-height:0}
       .dshr-detailHeader{display:flex;align-items:center;gap:8px;flex:none;padding:14px 20px;border-bottom:.5px solid var(--dsw-alias-border-l3)}
@@ -2214,6 +2440,17 @@ window.__ModuleLoader__.load({
           order: 100,
           locale: NS,
         }, DreamToast);
+      });
+
+      // Plugin Manager -> Plugins -> reminders row -> Configure. Registering this
+      // key is what makes the row's configure control appear; the page renders the
+      // same runtime settings the panel writes, so no Config schema is required.
+      ctx.slots.inject('plugins.row.config', function registerRowConfig() {
+        return ctx.slots.register({
+          name: 'plugins.row.config',
+          key: 'dsh-reminders-plugin#reminders',
+          locale: NS,
+        }, RemindersConfig);
       });
     }
 

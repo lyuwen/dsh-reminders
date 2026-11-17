@@ -453,6 +453,33 @@ test('tool values are lossless JSON even when views carry undefined fields', () 
   assert.equal(toLosslessJson('plain'), 'plain')
 })
 
+test('settings.update covers scan depth and freshness thresholds and persists', async () => {
+  const dir = join(workDir, 'settings')
+  const store = new ReminderStore(dir, { dreamEnabled: true, dreamIntervalMinutes: 10, windowHours: 72, staleHours: 24, forgetHours: 72, maxSessions: 12 })
+  const engine = new DreamEngine(store, fakeCtx())
+  await store.ready
+  const result = await dispatchAction(store, engine, 'settings.update', {
+    maxSessions: 20,
+    windowHours: 168,
+    staleHours: 48,
+    forgetHours: 12,
+  })
+  assert.equal(result.ok, true)
+  assert.equal(result.value.maxSessions, 20)
+  assert.equal(result.value.windowHours, 168)
+  assert.equal(result.value.staleHours, 48)
+  // A stale threshold past the forget threshold is reconciled, never inverted.
+  assert.equal(result.value.forgetHours, 48)
+  const snapshot = store.snapshot()
+  assert.equal(snapshot.settings.maxSessions, 20)
+  assert.ok(typeof snapshot.stateDir === 'string' && snapshot.stateDir.length > 0)
+  await new Promise((resolve) => setTimeout(resolve, 10))
+  const reopened = new ReminderStore(dir, { dreamEnabled: true, dreamIntervalMinutes: 10, windowHours: 72, staleHours: 24, forgetHours: 72, maxSessions: 12 })
+  await reopened.ready
+  assert.equal(reopened.state.settings.maxSessions, 20)
+  assert.equal(reopened.state.settings.staleHours, 48)
+})
+
 test('corrupt state file starts fresh instead of crashing', async () => {
   const dir = join(workDir, 'corrupt')
   const store = new ReminderStore(dir, { dreamEnabled: true, dreamIntervalMinutes: 10, windowHours: 72, staleHours: 24, forgetHours: 72, maxSessions: 12 })

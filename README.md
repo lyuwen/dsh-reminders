@@ -103,9 +103,19 @@ win over the row config on later boots.
 
 The Host half deliberately has **no runtime dependencies** (Node builtins only), so
 the bundle exports no `Config` schema: the row's `config` keys above are read as raw
-config and validated by the plugin itself, not by Cordis/Plugin Manager. They are
-therefore edited in `cordis.patch.yml` (not through a generated settings form); the
-panel's runtime controls are the supported way to change dreaming settings.
+config and validated by the plugin itself, not by Cordis. The UI does not depend on
+that schema — the bundle contributes its own row config page.
+
+### Where the settings live
+
+- **Reminders panel header** (quick controls): dreaming on/off and the scan interval.
+- **Plugins → Reminders → Configure** (full set): dreaming on/off, scan interval,
+  recent window, Sessions per pass, stale-after and forgotten-after thresholds.
+  The config page writes the same runtime settings through the authenticated plugin
+  API and shows the plugin state directory. Changes save immediately and win over
+  the `cordis.patch.yml` defaults on later boots.
+- **`cordis.patch.yml`**: bootstrap defaults only; useful for a fresh profile or for
+  keys with no UI control (`dataDir`).
 
 ## Layout
 

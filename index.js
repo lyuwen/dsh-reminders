@@ -724,6 +724,7 @@ class ReminderStore {
       revision: this.state.revision,
       now,
       panelId: PANEL_ID,
+      stateDir: this.dir,
       settings: {
         dreamEnabled: settings.dreamEnabled,
         dreamIntervalMinutes: settings.dreamIntervalMinutes,
@@ -902,6 +903,17 @@ class ReminderStore {
     if (Object.prototype.hasOwnProperty.call(payload ?? {}, 'windowHours')) {
       settings.windowHours = numberOr(payload.windowHours, settings.windowHours, 1, 720)
     }
+    if (Object.prototype.hasOwnProperty.call(payload ?? {}, 'maxSessions')) {
+      settings.maxSessions = numberOr(payload.maxSessions, settings.maxSessions, 1, 50)
+    }
+    if (Object.prototype.hasOwnProperty.call(payload ?? {}, 'staleHours')) {
+      settings.staleHours = numberOr(payload.staleHours, settings.staleHours, 1, 720)
+    }
+    if (Object.prototype.hasOwnProperty.call(payload ?? {}, 'forgetHours')) {
+      settings.forgetHours = numberOr(payload.forgetHours, settings.forgetHours, 1, 2160)
+    }
+    // "stale" must start before a reminder becomes "cold"/forgotten.
+    if (settings.staleHours > settings.forgetHours) settings.forgetHours = settings.staleHours
     this.touch()
     return { ...settings }
   }

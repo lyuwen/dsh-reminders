@@ -89,6 +89,7 @@ Use `fetch(url, { credentials: 'same-origin', headers... })`. Endpoint paths are
   "ok": true,
   "revision": 7,
   "now": 1763000000000,
+  "stateDir": "/home/you/.dsh/reminders",   // plugin-owned state directory (read-only info)
   "settings": {
     "dreamEnabled": true,
     "dreamIntervalMinutes": 10,
@@ -189,7 +190,7 @@ fields except `id`/`createdAt`/`source`/`sessionIds`):
 | `group.delete` | `{ id }` (items move to the default "General" group) |
 | `dream.run` | `{}` → `{ ok:true, value:{ started:true } }` (async; poll state) |
 | `dream.undo` | `{ activityId }` |
-| `settings.update` | `{ dreamEnabled?, dreamIntervalMinutes?, windowHours? }` |
+| `settings.update` | `{ dreamEnabled?, dreamIntervalMinutes?, windowHours?, maxSessions?, staleHours?, forgetHours? }` |
 
 `value` for `item.create`/`item.update` is the updated item view (same shape as GET
 items). Errors use codes like `invalid`, `not_found`, `busy`.
@@ -270,7 +271,18 @@ elevation, themed background/border/radius). Only rendered when
   refetch; "Undo" → `dream.undo` then refetch; "Open list" → `ctx.layout.selectPanel('reminders')`.
 - New activity ids appear on poll without a manual dismiss of older ones.
 
-### 3. `RemindersIcon` (sidebar.panellist)
+### 3. `RemindersConfig` (plugins.row.config)
+
+Register `{ name: 'plugins.row.config', key: 'dsh-reminders-plugin#reminders',
+locale: 'reminders' }`. The occupant receives `{ view: 'summary' | 'page' }`; render
+a one-line summary for `summary` and the settings form for `page`. Registering this
+key is what makes the Plugins-page row expose its **Configure** control. The form
+covers dreaming on/off, scan interval, recent window, Sessions per pass, stale-after
+and forgotten-after thresholds, auto-saves through `settings.update`, and shows the
+state directory from `stateDir`. It relies on the plugin's own API, not on an
+exported `Config` schema.
+
+### 4. `RemindersIcon` (sidebar.panellist)
 
 Inline SVG ~16–20px using `currentColor`, a checklist/bell with a small sparkle
 (dreaming) motif; `props.size` square; direct child, no wrapper div around the svg.

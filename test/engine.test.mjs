@@ -58,7 +58,7 @@ function handleFor(events) {
 }
 
 /** A ctx whose optional Session services resolve to provided fakes. */
-function fakeCtx({ sessions = [], snapshots = [], events = new Map(), titles = new Map() } = {}) {
+function fakeCtx({ sessions = [], snapshots = [], events = new Map(), titles = new Map(), llm, defaultModel } = {}) {
   const persistence = {
     async list() {
       return snapshots
@@ -89,11 +89,39 @@ function fakeCtx({ sessions = [], snapshots = [], events = new Map(), titles = n
       if (name === 'sessionPersistence') return persistence
       if (name === 'sessionQuery') return query
       if (name === 'sessions') return sessionsService
+      if (name === 'llm') return llm
+      if (name === 'agentDefaultModel') return defaultModel
       return undefined
     },
     logger: { warn() {} },
   }
 }
+
+/** Fake LLM service recording each streamed request and returning fixed JSON. */
+function fakeLlm(reply, captured = []) {
+  return {
+    listProviders() {
+      return [{ id: 'fake-provider', name: 'Fake Provider' }]
+    },
+    async listModels() {
+      return [{ id: 'fake-model', name: 'Fake Model' }]
+    },
+    async prepareCall(config) {
+      return {
+        config: { ...config },
+        stream(options) {
+          captured.push(options)
+          return (async function* stream() {
+            yield { type: 'text-delta', index: 0, text: reply }
+            yield { type: 'finish', reason: { kind: 'stop' } }
+          })()
+        },
+      }
+    },
+  }
+}
+
+const fakeDefaultModel = { currentSelection: () => ({ provider: 'fake-provider', model: 'fake-model' }) }
 
 /** Build one synthetic user message event (message fields sit directly on data). */
 function userMessage(seq, time, text, kind = 'user') {
@@ -491,4 +519,217 @@ test('corrupt state file starts fresh instead of crashing', async () => {
   await reopened.ready
   assert.equal(reopened.state.items.length, 0)
   assert.ok(reopened.state.groups.length >= 1)
+})
+
+test('model evaluation grades a session, caches the summary, and labels the activity', async () => {
+  const dir = join(workDir, 'llm-eval')
+  const store = new ReminderStore(dir, { dreamEnabled: true, dreamIntervalMinutes: 10, windowHours: 72, staleHours: 24, forgetHours: 72, maxSessions: 12, evalMode: 'model', evalProvider: '', evalModel: '', evalMaxSessions: 8, evalMaxItems: 0 })
+  const now = Date.now()
+  const events = [
+    userMessage(0, now - HOUR, 'Build the reminders evaluation'),
+    assistantMessage(1, now - HOUR + 1000, 'Prepared the evaluator and the cache.'),
+    turnEnd(2, now - HOUR + 2000, 'completed'),
+  ]
+  const captured = []
+  const reply = JSON.stringify({
+    sessions: {
+      'session-a': {
+        subtitle: 'Built the evaluator and the fingerprint cache.',
+        progress: 64,
+        importance: 5,
+        status: 'doing',
+        attention: 71,
+        attentionReason: 'Needs a decision on the storage format.',
+      },
+    },
+    items: {},
+  })
+  const ctx = fakeCtx({
+    snapshots: [snapshotFor('session-a', events, '/home/me/git/dsh-reminders')],
+    events: new Map([['session-a', events]]),
+    titles: new Map([['session-a', 'Build DSH reminders evaluation']]),
+    llm: fakeLlm(reply, captured),
+    defaultModel: fakeDefaultModel,
+  })
+  const engine = new DreamEngine(store, ctx)
+  const activity = await engine.run({ trigger: 'test' })
+  assert.equal(activity.status, 'done')
+  assert.equal(activity.model, 'fake-provider/fake-model')
+  assert.equal(activity.degraded, false)
+  assert.equal(activity.evaluated, 1)
+  assert.equal(captured.length, 1)
+  const item = store.state.items[0]
+  assert.equal(item.title, 'Build DSH reminders evaluation')
+  assert.equal(item.subtitle, 'Built the evaluator and the fingerprint cache.')
+  assert.equal(item.progress, 64)
+  assert.equal(item.importance, 5)
+  assert.equal(item.attentionScore, 71)
+  assert.match(item.attentionReason, /storage format/)
+  assert.equal(store.state.sessionSummaries['session-a'].fingerprint.length, 40)
+
+  // Unchanged Session: the summary comes from the cache, so no session is sent again.
+  await dispatchAction(store, engine, 'settings.update', { evalMaxItems: 0 })
+  const second = await engine.run({ trigger: 'test' })
+  assert.equal(second.evaluated, 0)
+  assert.equal(captured.length, 1)
+  assert.equal(store.state.items[0].subtitle, 'Built the evaluator and the fingerprint cache.')
+  assert.equal(store.state.items[0].importance, 5)
+})
+
+test('model failure falls back to heuristics without failing the pass', async () => {
+  const dir = join(workDir, 'llm-fail')
+  const store = new ReminderStore(dir, { dreamEnabled: true, dreamIntervalMinutes: 10, windowHours: 72, staleHours: 24, forgetHours: 72, maxSessions: 12, evalMode: 'model', evalProvider: '', evalModel: '', evalMaxSessions: 8, evalMaxItems: 0 })
+  const now = Date.now()
+  const events = [userMessage(0, now - HOUR, 'Fix the flaky test'), assistantMessage(1, now - HOUR + 500, 'Found the race.'), turnEnd(2, now - HOUR + 800, 'completed')]
+  const brokenLlm = {
+    listProviders: () => [{ id: 'fake-provider', name: 'Fake' }],
+    async listModels() {
+      return []
+    },
+    async prepareCall(config) {
+      return {
+        config: { ...config },
+        stream() {
+          return (async function* stream() {
+            yield { type: 'finish', reason: { kind: 'error', failure: { message: 'boom', code: 'X' } } }
+          })()
+        },
+      }
+    },
+  }
+  const ctx = fakeCtx({
+    snapshots: [snapshotFor('session-a', events, '/home/me/git/flaky')],
+    events: new Map([['session-a', events]]),
+    titles: new Map([['session-a', 'Fix the flaky test']]),
+    llm: brokenLlm,
+    defaultModel: fakeDefaultModel,
+  })
+  const engine = new DreamEngine(store, ctx)
+  const activity = await engine.run({ trigger: 'test' })
+  assert.equal(activity.status, 'done')
+  assert.equal(activity.degraded, true)
+  assert.equal(activity.model, null)
+  assert.match(activity.error, /boom/)
+  const item = store.state.items[0]
+  assert.ok(item.subtitle.length > 0)
+  assert.equal(item.title, 'Fix the flaky test')
+})
+
+test('pending approval marks the item awaiting and needs your attention', async () => {
+  const dir = join(workDir, 'awaiting')
+  const store = new ReminderStore(dir, { dreamEnabled: true, dreamIntervalMinutes: 10, windowHours: 72, staleHours: 24, forgetHours: 72, maxSessions: 12, evalMode: 'heuristic', evalProvider: '', evalModel: '', evalMaxSessions: 8, evalMaxItems: 0 })
+  const now = Date.now()
+  const events = [
+    userMessage(0, now - HOUR, 'Deploy the service'),
+    assistantMessage(1, now - HOUR + 500, 'I need permission to run the deploy.'),
+    { type: 'approval/asked', seq: 2, time: now - HOUR + 900, data: { callId: 'c1', title: 'Run deploy' } },
+  ]
+  const ctx = fakeCtx({
+    snapshots: [snapshotFor('session-deploy', events, '/home/me/git/deploy')],
+    events: new Map([['session-deploy', events]]),
+    titles: new Map([['session-deploy', 'Deploy the service']]),
+  })
+  const engine = new DreamEngine(store, ctx)
+  const activity = await engine.run({ trigger: 'test' })
+  assert.equal(activity.status, 'done')
+  const item = store.state.items[0]
+  assert.equal(item.status, 'awaiting')
+  assert.match(item.statusNote, /permission/)
+  assert.ok(item.attentionScore >= 60)
+  assert.ok(activity.changes.some((change) => change.kind === 'attention'))
+})
+
+test('learning calibrates importance, exposes notes, and respects manual locks', async () => {
+  const dir = join(workDir, 'learning')
+  const store = new ReminderStore(dir, { dreamEnabled: true, dreamIntervalMinutes: 10, windowHours: 72, staleHours: 24, forgetHours: 72, maxSessions: 12, evalMode: 'heuristic', evalProvider: '', evalModel: '', evalMaxSessions: 8, evalMaxItems: 0 })
+  const engine = new DreamEngine(store, fakeCtx())
+  await store.ready
+  const item = store.createItem({ title: 'Ship the reminder panel', progress: 20, importance: 3 })
+  item.lastAutoImportance = 3
+  item.lastAutoProgress = 20
+  // A user raising importance teaches the global and per-group calibration.
+  store.updateItem(item.id, { importance: 5, progress: 60 })
+  assert.ok(store.state.learning.importanceBias > 0)
+  assert.ok(store.state.learning.progressBias > 0)
+  assert.ok(store.state.learning.signals.some((signal) => signal.kind === 'importance' && signal.from === 3 && signal.to === 5))
+  assert.deepEqual(store.state.items[0].manualFields.slice().sort(), ['importance', 'progress', 'title'])
+  // Notes and biases round-trip through the same action the UI uses.
+  const updated = await dispatchAction(store, engine, 'learning.update', { notes: 'User ranks infra work highest.', attentionBias: 6, importanceBias: 1.2 })
+  assert.equal(updated.ok, true)
+  assert.equal(store.state.learning.notes, 'User ranks infra work highest.')
+  assert.equal(store.state.learning.attentionBias, 6)
+  assert.equal(store.snapshot().learning.notes, 'User ranks infra work highest.')
+  // Unlocking restores automatic grading.
+  await dispatchAction(store, engine, 'item.unlock', { id: item.id })
+  assert.deepEqual(store.state.items[0].manualFields, [])
+  await dispatchAction(store, engine, 'learning.clearSignals', {})
+  assert.equal(store.state.learning.signals.length, 0)
+  await dispatchAction(store, engine, 'learning.reset', {})
+  assert.equal(store.state.learning.notes, '')
+  assert.equal(store.state.learning.importanceBias, 0)
+})
+
+test('models.list returns providers and models for the configure page', async () => {
+  const dir = join(workDir, 'models')
+  const store = new ReminderStore(dir, { dreamEnabled: true, dreamIntervalMinutes: 10, windowHours: 72, staleHours: 24, forgetHours: 72, maxSessions: 12, evalMode: 'model', evalProvider: '', evalModel: '', evalMaxSessions: 8, evalMaxItems: 0 })
+  const engine = new DreamEngine(store, fakeCtx({ llm: fakeLlm('{}'), defaultModel: fakeDefaultModel }))
+  const result = await dispatchAction(store, engine, 'models.list', {})
+  assert.equal(result.ok, true)
+  assert.equal(result.value.providers.length, 1)
+  assert.equal(result.value.providers[0].id, 'fake-provider')
+  assert.deepEqual(result.value.providers[0].models, [{ id: 'fake-model', name: 'Fake Model' }])
+  const view = store.snapshot().evaluation
+  assert.equal(view.mode, 'model')
+  assert.equal(view.available, true)
+  assert.equal(view.provider, 'fake-provider')
+})
+
+test('partial settings and learning updates preserve untouched fields', async () => {
+  const dir = join(workDir, 'partial-updates')
+  const store = new ReminderStore(dir, { dreamEnabled: true, dreamIntervalMinutes: 10, windowHours: 72, staleHours: 24, forgetHours: 72, maxSessions: 12, evalMode: 'model', evalProvider: '', evalModel: '', evalMaxSessions: 8, evalMaxItems: 20 })
+  const engine = new DreamEngine(store, fakeCtx())
+  await store.ready
+  await dispatchAction(store, engine, 'settings.update', { evalMode: 'model', evalProvider: 'deepseek-official', evalModel: 'deepseek-flash' })
+  // Tool-style payloads carry explicit undefined keys; they must not clear fields.
+  await dispatchAction(store, engine, 'settings.update', { dreamIntervalMinutes: 15, evalMode: undefined, evalProvider: undefined, evalModel: undefined, evalMaxItems: undefined })
+  assert.equal(store.state.settings.evalProvider, 'deepseek-official')
+  assert.equal(store.state.settings.evalModel, 'deepseek-flash')
+  assert.equal(store.state.settings.evalMode, 'model')
+  assert.equal(store.state.settings.dreamIntervalMinutes, 15)
+  await dispatchAction(store, engine, 'learning.update', { notes: 'Prefer reliability.', importanceBias: 1.1, attentionBias: 5 })
+  await dispatchAction(store, engine, 'learning.update', { notes: 'Prefer reliability.', importanceBias: undefined, progressBias: undefined, attentionBias: undefined })
+  assert.equal(store.state.learning.importanceBias, 1.1)
+  assert.equal(store.state.learning.attentionBias, 5)
+  await dispatchAction(store, engine, 'learning.update', { progressBias: 7 })
+  assert.equal(store.state.learning.progressBias, 7)
+  assert.equal(store.state.learning.notes, 'Prefer reliability.')
+  assert.equal(store.state.learning.importanceBias, 1.1)
+})
+
+test('heuristic mode never poisons the model summary cache', async () => {
+  const dir = join(workDir, 'cache-mode')
+  const store = new ReminderStore(dir, { dreamEnabled: true, dreamIntervalMinutes: 10, windowHours: 72, staleHours: 24, forgetHours: 72, maxSessions: 12, evalMode: 'heuristic', evalProvider: '', evalModel: '', evalMaxSessions: 8, evalMaxItems: 0 })
+  const now = Date.now()
+  const events = [userMessage(0, now - HOUR, 'Tune the evaluator'), assistantMessage(1, now - HOUR + 500, 'Evaluation wired.'), turnEnd(2, now - HOUR + 900, 'completed')]
+  const reply = JSON.stringify({ sessions: { 'session-a': { subtitle: 'Model summary.', progress: 50, importance: 4, status: 'doing' } }, items: {} })
+  const captured = []
+  const ctx = fakeCtx({
+    snapshots: [snapshotFor('session-a', events, '/home/me/git/coach')],
+    events: new Map([['session-a', events]]),
+    titles: new Map([['session-a', 'Tune the evaluator']]),
+    llm: fakeLlm(reply, captured),
+    defaultModel: fakeDefaultModel,
+  })
+  const engine = new DreamEngine(store, ctx)
+  const heuristic = await engine.run({ trigger: 'test' })
+  assert.equal(heuristic.model, null)
+  assert.equal(captured.length, 0)
+  assert.equal(Object.keys(store.state.sessionSummaries).length, 0)
+  // Switch to model evaluation: the Session is evaluated and cached.
+  await dispatchAction(store, engine, 'settings.update', { evalMode: 'model' })
+  const model = await engine.run({ trigger: 'test' })
+  assert.equal(model.model, 'fake-provider/fake-model')
+  assert.equal(captured.length, 1)
+  assert.equal(store.state.sessionSummaries['session-a'].model, 'fake-provider/fake-model')
+  assert.equal(store.state.items[0].subtitle, 'Model summary.')
 })

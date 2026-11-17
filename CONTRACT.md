@@ -1,5 +1,7 @@
 # dsh-reminders — build contract
 
+> The LLM-evaluation/learning/awaiting-status delta lives in `CONTRACT-V2.md`.
+
 Single shared source of truth for the build. Host = `index.js` (Lead-owned).
 Client = `client.js` (client-ui teammate-owned). Do not edit files outside your scope.
 

@@ -17,12 +17,17 @@ window.__ModuleLoader__.load({
     const API_ROOT = 'api/dsh-reminders/';
     /** Timestamp of the last dreaming summary the user has actually seen. */
     const SEEN_KEY = 'dshr:lastSeenAt';
-    const STATUSES = ['todo', 'doing', 'blocked', 'done'];
+    const STATUSES = ['todo', 'doing', 'awaiting', 'blocked', 'done'];
     const FRESHNESS = ['fresh', 'warm', 'stale', 'cold'];
     const CHANGE_KINDS = ['created', 'updated', 'attention', 'grouped'];
     const IMPORTANCE_LEVELS = [1, 2, 3, 4, 5];
     const INTERVALS = [1, 5, 10, 15, 30, 60];
     const MAX_TITLE_LENGTH = 200;
+    /** Items at or above this attention score get a badge in the row. */
+    const ATTENTION_THRESHOLD = 60;
+    /** Item fields the evaluator may own; editing one records a manual lock. */
+    const MANUAL_FIELDS = ['title', 'subtitle', 'progress', 'importance'];
+    const SIGNAL_KINDS = ['importance', 'progress', 'status', 'title', 'subtitle', 'pin', 'delete', 'keep', 'dismiss'];
 
     // -------------------------------------------------------------------
     // Locale dictionaries (flat dotted keys; en and zh keep an equal key set)
@@ -52,9 +57,6 @@ window.__ModuleLoader__.load({
       'config.on': 'on',
       'config.off': 'off',
       'config.intro': 'Settings for the dreaming mode that maintains this reminder list. Changes save immediately and persist in the plugin state file.',
-      'config.model': 'Model',
-      'config.modelHint': 'Dreaming is deterministic: it scans Session metadata and titles, not prompts through a model.',
-      'config.modelNone': 'None used · zero tokens',
       'config.dreamEnabled': 'Dreaming mode',
       'config.dreamEnabledHint': 'Scan recent Sessions automatically on a timer.',
       'config.interval': 'Scan interval',
@@ -74,6 +76,75 @@ window.__ModuleLoader__.load({
       'config.unavailable': 'Settings are unavailable until the reminders Host responds.',
       'config.hours': '{n} h',
       'config.sessions': '{n}',
+      'config.evaluationTitle': 'Evaluation',
+      'config.evaluationHint': 'Dreaming grades progress, importance and attention with a model when one is available, and falls back to heuristics.',
+      'config.mode': 'Mode',
+      'config.modeHint': 'Choose whether the evaluator uses a model or deterministic heuristics.',
+      'config.modeModel': 'Model',
+      'config.modeHeuristic': 'Heuristic',
+      'config.provider': 'Provider',
+      'config.providerHint': 'Provider route used for evaluation calls.',
+      'config.evalModel': 'Model',
+      'config.evalModelHint': 'Exact model id used for evaluation calls.',
+      'config.followDefault': 'Follow default',
+      'config.resolvedRoute': 'Evaluating with {provider}/{model}',
+      'config.noModel': 'No model resolved; dreaming uses heuristics.',
+      'config.evalMaxSessions': 'Sessions evaluated per pass',
+      'config.evalMaxSessionsHint': 'Changed Sessions sent to the model each pass.',
+      'config.evalMaxItems': 'Open items graded per pass',
+      'config.evalMaxItemsHint': 'Items re-graded each pass; 0 disables item grading.',
+      'config.lastEvaluatedModel': 'Last pass used {model}',
+      'config.lastEvaluatedHeuristic': 'Last pass used heuristics',
+      'config.lastEvaluatedNone': 'No dreaming pass has run yet.',
+      'config.lastDegraded': '{model} failed; heuristics were used',
+      'config.modelsFailed': 'Could not load models: {message}',
+      'config.modelsRetry': 'Retry model list',
+      'config.modelsLoading': 'Loading models…',
+      'config.learningTitle': 'Learned preferences',
+      'config.learningHint': 'What dreaming learned from your edits. It is given to the evaluator and can be edited here.',
+      'config.learningNotes': 'Guidance for the evaluator',
+      'config.learningNotesPlaceholder': 'e.g. Release-blocking work matters most; ignore scratch experiments.',
+      'config.learningSave': 'Save',
+      'config.learningSaveFailed': 'Could not save learned preferences: {message}',
+      'config.importanceBias': 'Importance bias',
+      'config.importanceBiasHint': 'Added to model importance (-2 to +2).',
+      'config.progressBias': 'Progress bias',
+      'config.progressBiasHint': 'Added to model progress (-20 to +20).',
+      'config.attentionBias': 'Attention bias',
+      'config.attentionBiasHint': 'Added to model attention (-20 to +20).',
+      'config.learnedGroups': 'Learned project adjustments',
+      'config.learnedGroupsEmpty': 'No project adjustments learned yet.',
+      'config.learnedGroupSamples': '{n} samples',
+      'config.learningSignals': 'Recent signals',
+      'config.learningSignalsEmpty': 'No user edits recorded yet.',
+      'config.clearSignals': 'Clear signals',
+      'config.resetLearning': 'Reset learned preferences',
+      'config.resetConfirm': 'Confirm reset',
+      'config.resetHint': 'Clears learned notes, biases, projects and signals; click again to confirm.',
+      'config.signalFromTo': '{from} → {to}',
+      'status.awaiting': 'Needs you',
+      'attention.high': 'Attention {n}',
+      'attention.medium': 'Attention {n}',
+      'editor.subtitle': 'Subtitle',
+      'editor.subtitlePlaceholder': 'Short summary of where this work stands',
+      'editor.autoTitle': 'Auto-evaluated',
+      'editor.autoAttention': 'Attention {n}/100',
+      'editor.autoImportance': 'Model importance {n}/5',
+      'editor.autoProgress': 'Model progress {n}%',
+      'editor.autoHint': 'Derived from your sessions and learned preferences.',
+      'editor.locked': 'Auto-grading paused for {fields}.',
+      'editor.unlock': 'Restore auto-grading',
+      'editor.unlockSuccess': 'Auto-grading restored.',
+      'editor.unlockFailed': 'Could not restore auto-grading: {message}',
+      'signal.kind.importance': 'Importance',
+      'signal.kind.progress': 'Progress',
+      'signal.kind.status': 'Status',
+      'signal.kind.title': 'Title',
+      'signal.kind.subtitle': 'Subtitle',
+      'signal.kind.pin': 'Pin',
+      'signal.kind.delete': 'Delete',
+      'signal.kind.keep': 'Keep',
+      'signal.kind.dismiss': 'Dismiss',
       'dream.runFailed': 'Could not start dreaming: {message}',
       'search.placeholder': 'Search reminders',
       'search.label': 'Search reminders',
@@ -201,9 +272,6 @@ window.__ModuleLoader__.load({
       'config.on': '已开启',
       'config.off': '已关闭',
       'config.intro': '这是维护提醒清单的梦境模式设置。修改会立即保存，并写入插件的状态文件。',
-      'config.model': '模型',
-      'config.modelHint': '梦境模式是确定性的：只扫描会话元数据与标题，不会把内容发给模型。',
-      'config.modelNone': '不使用模型 · 零 token',
       'config.dreamEnabled': '梦境模式',
       'config.dreamEnabledHint': '按定时器自动扫描最近使用的会话。',
       'config.interval': '扫描间隔',
@@ -223,6 +291,75 @@ window.__ModuleLoader__.load({
       'config.unavailable': '提醒服务未响应，暂时无法读取设置。',
       'config.hours': '{n} 小时',
       'config.sessions': '{n}',
+      'config.evaluationTitle': '自动评估',
+      'config.evaluationHint': '有可用模型时，用模型评估进度、重要度与关注度；否则回退到启发式规则。',
+      'config.mode': '模式',
+      'config.modeHint': '选择评估器使用模型，还是仅使用确定性启发式规则。',
+      'config.modeModel': '模型',
+      'config.modeHeuristic': '启发式',
+      'config.provider': '服务提供方',
+      'config.providerHint': '评估请求使用的提供方路由。',
+      'config.evalModel': '模型',
+      'config.evalModelHint': '评估请求使用的具体模型 ID。',
+      'config.followDefault': '跟随默认',
+      'config.resolvedRoute': '正在使用 {provider}/{model} 评估',
+      'config.noModel': '没有可用的模型路由，梦境模式将使用启发式规则。',
+      'config.evalMaxSessions': '每轮评估会话数',
+      'config.evalMaxSessionsHint': '每轮发送给模型的变更会话数量。',
+      'config.evalMaxItems': '每轮评估条目数',
+      'config.evalMaxItemsHint': '每轮重新评估的条目数量；0 表示关闭条目评估。',
+      'config.lastEvaluatedModel': '上次评估使用 {model}',
+      'config.lastEvaluatedHeuristic': '上次评估使用启发式规则',
+      'config.lastEvaluatedNone': '还没有运行过梦境扫描。',
+      'config.lastDegraded': '{model} 调用失败，已使用启发式规则',
+      'config.modelsFailed': '无法加载模型列表：{message}',
+      'config.modelsRetry': '重新加载模型列表',
+      'config.modelsLoading': '正在加载模型…',
+      'config.learningTitle': '已学习的偏好',
+      'config.learningHint': '梦境模式从你的编辑中学到的内容。它会提供给评估器，也可以在这里手动修改。',
+      'config.learningNotes': '给评估器的指引',
+      'config.learningNotesPlaceholder': '例如：阻塞发布的工作最重要；忽略临时实验项目。',
+      'config.learningSave': '保存',
+      'config.learningSaveFailed': '无法保存已学习偏好：{message}',
+      'config.importanceBias': '重要度偏置',
+      'config.importanceBiasHint': '加到模型给出的重要度上（-2 到 +2）。',
+      'config.progressBias': '进度偏置',
+      'config.progressBiasHint': '加到模型给出的进度上（-20 到 +20）。',
+      'config.attentionBias': '关注度偏置',
+      'config.attentionBiasHint': '加到模型给出的关注度上（-20 到 +20）。',
+      'config.learnedGroups': '已学习的项目调整',
+      'config.learnedGroupsEmpty': '还没有学到项目级调整。',
+      'config.learnedGroupSamples': '{n} 个样本',
+      'config.learningSignals': '最近的反馈信号',
+      'config.learningSignalsEmpty': '还没有记录用户编辑。',
+      'config.clearSignals': '清除信号',
+      'config.resetLearning': '重置已学习偏好',
+      'config.resetConfirm': '确认重置',
+      'config.resetHint': '将清除已学习的笔记、偏置、项目调整与信号；再次点击以确认。',
+      'config.signalFromTo': '{from} → {to}',
+      'status.awaiting': '需要你',
+      'attention.high': '关注 {n}',
+      'attention.medium': '关注 {n}',
+      'editor.subtitle': '进度摘要',
+      'editor.subtitlePlaceholder': '简要概括这项工作当前的进展',
+      'editor.autoTitle': '自动评估',
+      'editor.autoAttention': '关注度 {n}/100',
+      'editor.autoImportance': '模型重要度 {n}/5',
+      'editor.autoProgress': '模型进度 {n}%',
+      'editor.autoHint': '根据你的会话与已学习的偏好得出。',
+      'editor.locked': '以下字段已暂停自动评估：{fields}。',
+      'editor.unlock': '恢复自动评估',
+      'editor.unlockSuccess': '已恢复自动评估。',
+      'editor.unlockFailed': '无法恢复自动评估：{message}',
+      'signal.kind.importance': '重要度',
+      'signal.kind.progress': '进度',
+      'signal.kind.status': '状态',
+      'signal.kind.title': '标题',
+      'signal.kind.subtitle': '摘要',
+      'signal.kind.pin': '置顶',
+      'signal.kind.delete': '删除',
+      'signal.kind.keep': '保留',
+      'signal.kind.dismiss': '忽略',
       'dream.runFailed': '无法启动扫描：{message}',
       'search.placeholder': '搜索提醒',
       'search.label': '搜索提醒',
@@ -349,6 +486,14 @@ window.__ModuleLoader__.load({
       return rounded;
     }
 
+    function clampNumber(value, min, max, fallback) {
+      const parsed = typeof value === 'number' ? value : Number(value);
+      if (!isFinite(parsed)) return fallback;
+      if (parsed < min) return min;
+      if (parsed > max) return max;
+      return parsed;
+    }
+
     function messageOf(error) {
       if (!error) return '';
       if (typeof error === 'string') return error;
@@ -376,6 +521,35 @@ window.__ModuleLoader__.load({
 
     function sourceKeyOf(item) {
       return item && item.source === 'dream' ? 'source.dream' : 'source.manual';
+    }
+
+    /** Clamped contextual attention carried by an item view. */
+    function attentionOf(item) {
+      return {
+        score: clampInt(item && item.attentionScore, 0, 100, 0),
+        reason: str(item && item.attentionReason),
+      };
+    }
+
+    /** The row's supporting line: the evaluated summary, else the manual next step. */
+    function subtitleOf(item) {
+      return str(item && item.subtitle) || str(item && item.nextStep);
+    }
+
+    /** Manual locks reported by the Host, limited to fields this client edits. */
+    function manualFieldsOf(item) {
+      if (!item || !Array.isArray(item.manualFields)) return [];
+      const result = [];
+      for (const field of item.manualFields) {
+        const value = str(field);
+        if (MANUAL_FIELDS.indexOf(value) >= 0 && result.indexOf(value) < 0) result.push(value);
+      }
+      return result;
+    }
+
+    function signalKindLabel(t, kind) {
+      const value = str(kind);
+      return SIGNAL_KINDS.indexOf(value) >= 0 ? t('signal.kind.' + value) : value;
     }
 
     function kindLabel(t, kind) {
@@ -411,6 +585,9 @@ window.__ModuleLoader__.load({
         const leftPinned = left && left.pinned === true ? 1 : 0;
         const rightPinned = right && right.pinned === true ? 1 : 0;
         if (leftPinned !== rightPinned) return rightPinned - leftPinned;
+        const leftAttention = num(left && left.attentionScore, 0);
+        const rightAttention = num(right && right.attentionScore, 0);
+        if (leftAttention !== rightAttention) return rightAttention - leftAttention;
         const leftImportance = num(left && left.importance, 0);
         const rightImportance = num(right && right.importance, 0);
         if (leftImportance !== rightImportance) return rightImportance - leftImportance;
@@ -430,7 +607,10 @@ window.__ModuleLoader__.load({
         if (!query) return true;
         const parts = [
           str(item.title),
+          str(item.subtitle),
           str(item.nextStep),
+          str(item.statusNote),
+          str(item.attentionReason),
           str(item.notes),
           groupNames.get(str(item.groupId)) || '',
         ];
@@ -980,7 +1160,10 @@ window.__ModuleLoader__.load({
       const progress = clampInt(item.progress, 0, 100, 0);
       const importance = clampInt(item.importance, 1, 5, 3);
       const title = str(item.title) || t('toast.unknownItem');
-      const nextStep = str(item.nextStep);
+      const subtitle = subtitleOf(item);
+      const statusNote = str(item.statusNote);
+      const attention = attentionOf(item);
+      const attentionLevel = attention.score >= 80 ? 'high' : 'medium';
       const pinned = item.pinned === true;
       const done = status === 'done';
       const selected = props.selected === true;
@@ -1008,11 +1191,18 @@ window.__ModuleLoader__.load({
           h('div', { className: 'dshr-rowMain' },
             h('div', { className: 'dshr-rowTop' },
               h('span', { className: 'dshr-rowTitle', title: title }, title),
-              pinned ? h('span', { className: 'dshr-pin', 'aria-hidden': 'true' }, '★') : null
+              pinned ? h('span', { className: 'dshr-pin', 'aria-hidden': 'true' }, '★') : null,
+              attention.score >= ATTENTION_THRESHOLD ? h('span', {
+                className: 'dshr-attentionBadge',
+                'data-level': attentionLevel,
+                title: attention.reason || undefined,
+                'aria-label': t(attentionLevel === 'high' ? 'attention.high' : 'attention.medium', { n: attention.score }),
+              }, t(attentionLevel === 'high' ? 'attention.high' : 'attention.medium', { n: attention.score })) : null
             ),
-            nextStep ? h('div', { className: 'dshr-rowNext', title: nextStep }, nextStep) : null,
+            subtitle ? h('div', { className: 'dshr-rowSubtitle', title: subtitle }, subtitle) : null,
             h('div', { className: 'dshr-rowMeta' },
               h('span', { className: 'dshr-freshness', 'data-freshness': freshness }, t('freshness.' + freshness)),
+              statusNote ? h('span', { className: 'dshr-rowStatusNote', title: statusNote }, statusNote) : null,
               h('span', { className: 'dshr-rowMetaItem' }, t('row.progress', { n: progress })),
               h('span', {
                 className: 'dshr-stars',
@@ -1053,6 +1243,7 @@ window.__ModuleLoader__.load({
       const isNew = item === null;
       const groups = Array.isArray(props.groups) ? props.groups.filter(isObject) : [];
       const [title, setTitle] = React.useState(function initialTitle() { return item ? str(item.title) : ''; });
+      const [subtitle, setSubtitle] = React.useState(function initialSubtitle() { return item ? str(item.subtitle) : ''; });
       const [status, setStatus] = React.useState(function initialStatus() { return statusOf(item); });
       const [progress, setProgress] = React.useState(function initialProgress() { return clampInt(item && item.progress, 0, 100, 0); });
       const [importance, setImportance] = React.useState(function initialImportance() { return clampInt(item && item.importance, 1, 5, 3); });
@@ -1072,6 +1263,9 @@ window.__ModuleLoader__.load({
       const [newGroupOpen, setNewGroupOpen] = React.useState(false);
       const [newGroupName, setNewGroupName] = React.useState('');
       const [groupBusy, setGroupBusy] = React.useState(false);
+      const [unlockBusy, setUnlockBusy] = React.useState(false);
+      const [unlockNote, setUnlockNote] = React.useState(null);
+      const [unlockError, setUnlockError] = React.useState(false);
 
       React.useEffect(function syncGroupSelection() {
         const known = groups.some(function hasGroup(group) { return group && group.id === groupId; });
@@ -1084,6 +1278,23 @@ window.__ModuleLoader__.load({
         const first = groups.find(function findGroup(group) { return group && typeof group.id === 'string' && group.id; });
         if (first) setGroupId(first.id);
       }, [groups, groupId, item]);
+
+      const unlockFields = async function unlockFields() {
+        if (!item || unlockBusy) return;
+        setUnlockBusy(true);
+        setUnlockNote(null);
+        setUnlockError(false);
+        try {
+          await postAction('item.unlock', { id: item.id });
+          await refresh();
+          setUnlockNote(t('editor.unlockSuccess'));
+        } catch (unlockFailure) {
+          setUnlockError(true);
+          setUnlockNote(t('editor.unlockFailed', { message: messageOf(unlockFailure) || t('error.unknown') }));
+        } finally {
+          setUnlockBusy(false);
+        }
+      };
 
       const onClose = typeof props.onClose === 'function' ? props.onClose : function noopClose() {};
       const onSaved = typeof props.onSaved === 'function' ? props.onSaved : function noopSaved() {};
@@ -1116,6 +1327,7 @@ window.__ModuleLoader__.load({
         try {
           const patch = {
             title: trimmedTitle,
+            subtitle: subtitle.trim(),
             notes: notes,
             nextStep: nextStep,
             status: status,
@@ -1191,6 +1403,32 @@ window.__ModuleLoader__.load({
         );
       })();
 
+      const autoAttention = attentionOf(item);
+      const lockedFields = manualFieldsOf(item);
+      const lastAutoImportance = item ? clampInt(item.lastAutoImportance, 0, 5, 0) : 0;
+      const lastAutoProgress = item ? clampInt(item.lastAutoProgress, 0, 100, 0) : 0;
+      const showAuto = !isNew && (autoAttention.score > 0 || autoAttention.reason !== '' || lastAutoImportance > 0 || lastAutoProgress > 0 || lockedFields.length > 0);
+      const autoBlock = showAuto ? h('div', { className: 'dshr-autoBlock' },
+        h('div', { className: 'dshr-autoHead' },
+          h('span', { className: 'dshr-label' }, t('editor.autoTitle')),
+          lockedFields.length > 0 ? h('button', {
+            type: 'button',
+            className: 'dshr-btn dshr-btn--ghost dshr-btn--small',
+            disabled: unlockBusy,
+            onClick: unlockFields,
+          }, unlockBusy ? t('editor.saving') : t('editor.unlock')) : null
+        ),
+        h('p', { className: 'dshr-autoLine' }, t('editor.autoAttention', { n: autoAttention.score })),
+        autoAttention.reason ? h('p', { className: 'dshr-autoReason' }, autoAttention.reason) : null,
+        lastAutoImportance > 0 ? h('p', { className: 'dshr-autoLine' }, t('editor.autoImportance', { n: lastAutoImportance })) : null,
+        lastAutoProgress > 0 ? h('p', { className: 'dshr-autoLine' }, t('editor.autoProgress', { n: lastAutoProgress })) : null,
+        h('p', { className: 'dshr-autoHint' }, t('editor.autoHint')),
+        lockedFields.length > 0 ? h('p', { className: 'dshr-lockedLine' }, t('editor.locked', {
+          fields: lockedFields.map(function fieldLabel(field) { return t('editor.' + field); }).join(', '),
+        })) : null,
+        unlockNote ? h('p', { className: unlockError ? 'dshr-fieldError' : 'dshr-autoNotice' }, unlockNote) : null
+      ) : null;
+
       const fields = [
         h('div', { key: 'title', className: 'dshr-field' },
           h('span', { className: 'dshr-label' }, t('editor.title')),
@@ -1205,6 +1443,16 @@ window.__ModuleLoader__.load({
             onChange: function onChange(event) { setTitle(event.target.value); },
           }),
           titleTouched && titleError ? h('p', { className: 'dshr-fieldError' }, titleError) : null
+        ),
+        h('div', { key: 'subtitle', className: 'dshr-field' },
+          h('span', { className: 'dshr-label' }, t('editor.subtitle')),
+          h('textarea', {
+            className: 'dshr-textarea',
+            value: subtitle,
+            placeholder: t('editor.subtitlePlaceholder'),
+            'aria-label': t('editor.subtitle'),
+            onChange: function onChange(event) { setSubtitle(event.target.value); },
+          })
         ),
         h('div', { key: 'status', className: 'dshr-field' },
           h('span', { className: 'dshr-label' }, t('editor.status')),
@@ -1361,6 +1609,7 @@ window.__ModuleLoader__.load({
         ),
         h('div', { className: 'dshr-editorScroll' },
           meta,
+          autoBlock,
           fields,
           error ? h('p', { className: 'dshr-fieldError', role: 'alert' }, error) : null
         ),
@@ -2025,6 +2274,8 @@ window.__ModuleLoader__.load({
     const CONFIG_MAX_SESSIONS = [6, 12, 20, 30];
     const CONFIG_STALE = [12, 24, 48, 72];
     const CONFIG_FORGET = [48, 72, 120, 168, 336];
+    const CONFIG_EVAL_SESSIONS = [4, 8, 12, 20, 30];
+    const CONFIG_EVAL_ITEMS = [0, 10, 20, 30, 40];
 
     /** Include the current value even when it is not one of the presets. */
     function presetOptions(values, current) {
@@ -2044,38 +2295,125 @@ window.__ModuleLoader__.load({
       );
     }
 
+    function ConfigNumber(props) {
+      const [draft, setDraft] = React.useState(function initialDraft() {
+        return String(num(props.value, 0));
+      });
+      React.useEffect(function syncDraft() {
+        setDraft(String(num(props.value, 0)));
+      }, [props.value]);
+      const commit = function commit() {
+        const parsed = typeof draft === 'string' ? Number(draft) : NaN;
+        if (!isFinite(parsed)) {
+          setDraft(String(num(props.value, 0)));
+          return;
+        }
+        const clamped = clampNumber(parsed, num(props.min, -100), num(props.max, 100), num(props.value, 0));
+        if (clamped === num(props.value, 0)) return;
+        if (typeof props.onCommit === 'function') props.onCommit(clamped);
+      };
+      return h('input', {
+        type: 'number',
+        className: 'dshr-input dshr-configNumber',
+        min: props.min,
+        max: props.max,
+        step: props.step === undefined ? 1 : props.step,
+        value: draft,
+        disabled: props.disabled === true,
+        'aria-label': props.label || '',
+        onChange: function onChange(event) { setDraft(event.target.value); },
+        onBlur: commit,
+        onKeyDown: function onKeyDown(event) {
+          if (event.key === 'Enter') {
+            event.preventDefault();
+            if (event.currentTarget && typeof event.currentTarget.blur === 'function') event.currentTarget.blur();
+          }
+        },
+      });
+    }
+
     function RemindersConfig(props) {
       const t = translatorOf(props);
       const snapshot = React.useSyncExternalStore(subscribeStore, getSnapshot);
       const [saving, setSaving] = React.useState('');
       const [saved, setSaved] = React.useState(false);
       const [error, setError] = React.useState(null);
+      const [models, setModels] = React.useState({ status: 'idle', providers: [], error: '' });
+      const [notesDraft, setNotesDraft] = React.useState('');
+      const [confirmReset, setConfirmReset] = React.useState(false);
       const data = isObject(snapshot.data) ? snapshot.data : null;
       const settings = data && isObject(data.settings) ? data.settings : null;
+      const evaluation = data && isObject(data.evaluation) ? data.evaluation : null;
+      const learning = data && isObject(data.learning) ? data.learning : null;
       const stateDir = data ? str(data.stateDir) : '';
       const summaryOnly = Boolean(props && props.view === 'summary');
 
-      const save = function save(patch, key) {
-        if (saving !== '') return;
+      const loadModels = function loadModels() {
+        setModels({ status: 'loading', providers: [], error: '' });
+        Promise.resolve()
+          .then(function request() {
+            return postAction('models.list', {});
+          })
+          .then(function ready(value) {
+            const raw = value && Array.isArray(value.providers) ? value.providers : [];
+            const providers = [];
+            for (const entry of raw) {
+              if (!isObject(entry)) continue;
+              const id = str(entry.id);
+              if (!id) continue;
+              const list = Array.isArray(entry.models)
+                ? entry.models.filter(isObject).map(function mapModel(model) {
+                  return { id: str(model.id), name: str(model.name) || str(model.id) };
+                }).filter(function hasId(model) { return model.id !== ''; })
+                : [];
+              providers.push({ id: id, name: str(entry.name) || id, models: list });
+            }
+            setModels({ status: 'ready', providers: providers, error: '' });
+          })
+          .catch(function failed(modelError) {
+            setModels({ status: 'error', providers: [], error: messageOf(modelError) || t('error.unknown') });
+          });
+      };
+
+      const learningStamp = learning ? num(learning.updatedAt, 0) : 0;
+      React.useEffect(function loadCatalog() {
+        if (!summaryOnly) loadModels();
+      }, [summaryOnly]);
+
+      React.useEffect(function syncNotes() {
+        setNotesDraft(learning ? str(learning.notes) : '');
+      }, [learningStamp]);
+
+      const runAction = function runAction(action, payload, key, failureKey) {
+        if (saving !== '') return Promise.resolve(false);
         setSaving(key);
         setSaved(false);
         setError(null);
-        Promise.resolve()
-          .then(function run() {
-            return postAction('settings.update', patch);
+        return Promise.resolve()
+          .then(function request() {
+            return postAction(action, payload);
           })
           .then(function reload() {
             return refresh();
           })
           .then(function done() {
             setSaved(true);
+            return true;
           })
-          .catch(function failed(saveError) {
-            setError(t('config.saveFailed', { message: messageOf(saveError) || t('error.unknown') }));
+          .catch(function failed(actionError) {
+            setError(t(failureKey || 'config.saveFailed', { message: messageOf(actionError) || t('error.unknown') }));
+            return false;
           })
           .finally(function settle() {
             setSaving('');
           });
+      };
+
+      const saveSettings = function saveSettings(patch, key) {
+        return runAction('settings.update', patch, key, 'config.saveFailed');
+      };
+      const saveLearning = function saveLearning(payload, key) {
+        return runAction('learning.update', payload, key, 'config.learningSaveFailed');
       };
 
       if (summaryOnly) {
@@ -2096,7 +2434,39 @@ window.__ModuleLoader__.load({
       const maxSessions = settings ? clampInt(settings.maxSessions, 1, 50, 12) : 12;
       const staleHours = settings ? clampInt(settings.staleHours, 1, 720, 24) : 24;
       const forgetHours = settings ? clampInt(settings.forgetHours, 1, 2160, 72) : 72;
+      const evalMode = settings && settings.evalMode === 'heuristic' ? 'heuristic' : 'model';
+      const explicitProvider = settings ? str(settings.evalProvider) : '';
+      const explicitModel = settings ? str(settings.evalModel) : '';
+      const evalMaxSessions = settings ? clampInt(settings.evalMaxSessions, 1, 30, 8) : 8;
+      const evalMaxItems = settings ? clampInt(settings.evalMaxItems, 0, 40, 20) : 20;
+      const providers = models.providers;
+      const selectedProvider = providers.find(function findProvider(provider) { return provider.id === explicitProvider; });
+      const providerModels = selectedProvider ? selectedProvider.models : [];
+      const heuristic = evalMode === 'heuristic';
       const disabled = saving !== '' || !settings;
+      const learningDisabled = saving !== '' || !learning;
+      const resolvedProvider = evaluation ? str(evaluation.provider) : '';
+      const resolvedModel = evaluation ? str(evaluation.model) : '';
+      const lastModel = evaluation ? str(evaluation.lastModel) : '';
+      const lastDegraded = evaluation ? evaluation.lastDegraded === true : false;
+      const lastRunAt = data && isObject(data.dream) ? num(data.dream.lastRunAt, 0) : 0;
+      let lastEvaluatedText = t('config.lastEvaluatedNone');
+      if (lastModel !== '') {
+        lastEvaluatedText = lastDegraded
+          ? t('config.lastDegraded', { model: lastModel })
+          : t('config.lastEvaluatedModel', { model: lastModel });
+      } else if (lastRunAt > 0) {
+        lastEvaluatedText = t('config.lastEvaluatedHeuristic');
+      }
+      const importanceBias = learning ? clampNumber(learning.importanceBias, -2, 2, 0) : 0;
+      const progressBias = learning ? clampNumber(learning.progressBias, -20, 20, 0) : 0;
+      const attentionBias = learning ? clampNumber(learning.attentionBias, -20, 20, 0) : 0;
+      const learnedGroups = learning && Array.isArray(learning.groups)
+        ? learning.groups.filter(isObject).slice().sort(function bySamples(left, right) {
+          return num(right.samples, 0) - num(left.samples, 0);
+        }).slice(0, 6)
+        : [];
+      const signals = learning && Array.isArray(learning.signals) ? learning.signals.filter(isObject).slice(0, 8) : [];
 
       const numberSelect = function numberSelect(key, value, options, format, patch) {
         return h('select', {
@@ -2107,7 +2477,7 @@ window.__ModuleLoader__.load({
           value: String(value),
           onChange: function onChange(event) {
             const next = Number(event.target.value);
-            if (isFinite(next) && next !== value) save(patch(next), key);
+            if (isFinite(next) && next !== value) saveSettings(patch(next), key);
           },
         }, presetOptions(options, value).map(function renderOption(option) {
           return h('option', { key: String(option), value: String(option) }, format(option));
@@ -2125,10 +2495,9 @@ window.__ModuleLoader__.load({
         body.push(h('p', { key: 'error', className: 'dshr-notice dshr-notice--error', role: 'alert' }, error));
       }
       body.push(h('p', { key: 'intro', className: 'dshr-configIntro' }, t('config.intro')));
+
+      // --- dreaming basics -------------------------------------------------
       body.push(h('div', { key: 'rows', className: 'dshr-configRows' },
-        h(ConfigRow, { label: t('config.model'), hint: t('config.modelHint') },
-          h('span', { className: 'dshr-configInfo' }, t('config.modelNone'))
-        ),
         h(ConfigRow, { label: t('config.dreamEnabled'), hint: t('config.dreamEnabledHint') },
           h('button', {
             type: 'button',
@@ -2138,7 +2507,7 @@ window.__ModuleLoader__.load({
             'aria-label': t('config.dreamEnabled'),
             disabled: disabled,
             onClick: function toggle() {
-              if (!disabled) save({ dreamEnabled: !dreamEnabled }, 'dreamEnabled');
+              if (!disabled) saveSettings({ dreamEnabled: !dreamEnabled }, 'dreamEnabled');
             },
           }, h('span', { className: 'dshr-toggleKnob', 'aria-hidden': 'true' }))
         ),
@@ -2178,6 +2547,262 @@ window.__ModuleLoader__.load({
           })
         )
       ));
+
+      // --- evaluation ------------------------------------------------------
+      const providerOptions = [h('option', { key: 'follow', value: '' }, t('config.followDefault'))];
+      for (const provider of providers) {
+        providerOptions.push(h('option', { key: provider.id, value: provider.id }, provider.name));
+      }
+      if (explicitProvider !== '' && !selectedProvider) {
+        providerOptions.push(h('option', { key: explicitProvider, value: explicitProvider }, explicitProvider));
+      }
+      const modelOptions = [];
+      for (const model of providerModels) {
+        modelOptions.push(h('option', { key: model.id, value: model.id }, model.name));
+      }
+      if (explicitModel !== '' && !providerModels.some(function hasModel(model) { return model.id === explicitModel; })) {
+        modelOptions.push(h('option', { key: explicitModel, value: explicitModel }, explicitModel));
+      }
+      if (modelOptions.length === 0) {
+        modelOptions.push(h('option', { key: 'none', value: '' }, heuristic ? t('config.modeHeuristic') : t('config.followDefault')));
+      }
+
+      const modeSegmented = h('div', { className: 'dshr-segmented' },
+        ['model', 'heuristic'].map(function renderMode(mode) {
+          return h('button', {
+            key: mode,
+            type: 'button',
+            className: 'dshr-segBtn',
+            'aria-pressed': evalMode === mode ? 'true' : 'false',
+            disabled: disabled,
+            onClick: function choose() {
+              if (!disabled && evalMode !== mode) saveSettings({ evalMode: mode }, 'evalMode');
+            },
+          }, mode === 'model' ? t('config.modeModel') : t('config.modeHeuristic'));
+        })
+      );
+
+      const evalRows = [
+        h(ConfigRow, { key: 'mode', label: t('config.mode'), hint: t('config.modeHint') }, modeSegmented),
+        h(ConfigRow, { key: 'maxSessions', label: t('config.evalMaxSessions'), hint: t('config.evalMaxSessionsHint') },
+          numberSelect('evalMaxSessions', evalMaxSessions, CONFIG_EVAL_SESSIONS, function sessions(value) {
+            return t('config.sessions', { n: value });
+          }, function patchEvalSessions(value) {
+            return { evalMaxSessions: value };
+          })
+        ),
+        h(ConfigRow, { key: 'maxItems', label: t('config.evalMaxItems'), hint: t('config.evalMaxItemsHint') },
+          numberSelect('evalMaxItems', evalMaxItems, CONFIG_EVAL_ITEMS, function items(value) {
+            return t('config.sessions', { n: value });
+          }, function patchEvalItems(value) {
+            return { evalMaxItems: value };
+          })
+        ),
+        h(ConfigRow, { key: 'provider', label: t('config.provider'), hint: t('config.providerHint') },
+          h('select', {
+            className: 'dshr-select dshr-configSelect',
+            'aria-label': t('config.provider'),
+            disabled: disabled || heuristic || models.status === 'loading',
+            value: explicitProvider,
+            onChange: function onChange(event) {
+              const next = str(event.target.value);
+              if (next === explicitProvider) return;
+              if (next === '') {
+                saveSettings({ evalProvider: '', evalModel: '' }, 'evalProvider');
+                return;
+              }
+              const provider = providers.find(function findProvider(entry) { return entry.id === next; });
+              const firstModel = provider && provider.models.length > 0 ? provider.models[0].id : '';
+              saveSettings({ evalProvider: next, evalModel: firstModel }, 'evalProvider');
+            },
+          }, providerOptions)
+        ),
+        h(ConfigRow, { key: 'model', label: t('config.evalModel'), hint: t('config.evalModelHint') },
+          h('select', {
+            className: 'dshr-select dshr-configSelect',
+            'aria-label': t('config.evalModel'),
+            disabled: disabled || heuristic || explicitProvider === '' || models.status === 'loading',
+            value: explicitModel,
+            onChange: function onChange(event) {
+              const next = str(event.target.value);
+              if (next !== explicitModel) saveSettings({ evalModel: next }, 'evalModel');
+            },
+          }, modelOptions)
+        )
+      ];
+      const evalSection = [
+        h('div', { key: 'head', className: 'dshr-configSectionHead' },
+          h('h3', { className: 'dshr-configSectionTitle' }, t('config.evaluationTitle')),
+          h('p', { className: 'dshr-configSectionHint' }, t('config.evaluationHint'))
+        ),
+        models.status === 'loading'
+          ? h('p', { key: 'loading', className: 'dshr-configSectionHint' }, t('config.modelsLoading'))
+          : null,
+        models.status === 'error'
+          ? h('div', { key: 'modelsError', className: 'dshr-configErrorBlock' },
+            h('p', { className: 'dshr-configError' }, t('config.modelsFailed', { message: models.error || t('error.unknown') })),
+            h('button', { type: 'button', className: 'dshr-btn dshr-btn--small', onClick: loadModels }, t('config.modelsRetry'))
+          )
+          : null,
+        h('div', { key: 'rows', className: 'dshr-configRows' }, evalRows),
+        h('p', { key: 'resolved', className: 'dshr-configInfoLine' },
+          heuristic
+            ? t('config.modeHeuristic')
+            : (evaluation && evaluation.enabled === true
+              ? t('config.resolvedRoute', { provider: resolvedProvider, model: resolvedModel })
+              : t('config.noModel'))
+        ),
+        h('p', { key: 'last', className: 'dshr-configInfoLine' }, lastEvaluatedText)
+      ];
+      body.push(h('div', { key: 'evaluation', className: 'dshr-configSection' }, evalSection));
+
+      // --- learned preferences --------------------------------------------
+      const biasRow = function biasRow(key, label, hint, value, min, max, step, commit) {
+        return h(ConfigRow, { key: key, label: label, hint: hint },
+          h(ConfigNumber, {
+            label: label,
+            value: value,
+            min: min,
+            max: max,
+            step: step,
+            disabled: learningDisabled,
+            onCommit: commit,
+          })
+        );
+      };
+      const learnedRows = [
+        biasRow('importanceBias', t('config.importanceBias'), t('config.importanceBiasHint'), importanceBias, -2, 2, 0.1, function commitImportance(next) {
+          saveLearning({ importanceBias: next }, 'importanceBias');
+        }),
+        biasRow('progressBias', t('config.progressBias'), t('config.progressBiasHint'), progressBias, -20, 20, 1, function commitProgress(next) {
+          saveLearning({ progressBias: next }, 'progressBias');
+        }),
+        biasRow('attentionBias', t('config.attentionBias'), t('config.attentionBiasHint'), attentionBias, -20, 20, 1, function commitAttention(next) {
+          saveLearning({ attentionBias: next }, 'attentionBias');
+        })
+      ];
+      const groupsBlock = learnedGroups.length === 0
+        ? h('p', { key: 'groupsEmpty', className: 'dshr-configSectionHint' }, t('config.learnedGroupsEmpty'))
+        : h('div', { key: 'groups', className: 'dshr-configGroups' }, learnedGroups.map(function renderGroup(group) {
+          const name = str(group.name);
+          const samples = clampInt(group.samples, 0, 1000000, 0);
+          const groupImportance = clampNumber(group.importanceBias, -2, 2, 0);
+          const groupAttention = clampNumber(group.attentionBias, -20, 20, 0);
+          return h('div', { key: 'group:' + name, className: 'dshr-configGroup' },
+            h('span', { className: 'dshr-configGroupName', title: name }, name),
+            h('span', { className: 'dshr-configGroupSamples' }, t('config.learnedGroupSamples', { n: samples })),
+            h(ConfigNumber, {
+              label: t('config.importanceBias'),
+              value: groupImportance,
+              min: -2,
+              max: 2,
+              step: 0.1,
+              disabled: learningDisabled,
+              onCommit: function commitGroupImportance(next) {
+                saveLearning({ groups: [{ name: name, importanceBias: next, attentionBias: groupAttention }] }, 'group:' + name);
+              },
+            }),
+            h(ConfigNumber, {
+              label: t('config.attentionBias'),
+              value: groupAttention,
+              min: -20,
+              max: 20,
+              step: 1,
+              disabled: learningDisabled,
+              onCommit: function commitGroupAttention(next) {
+                saveLearning({ groups: [{ name: name, importanceBias: groupImportance, attentionBias: next }] }, 'group:' + name);
+              },
+            })
+          );
+        }));
+      const signalsBlock = signals.length === 0
+        ? h('p', { key: 'signalsEmpty', className: 'dshr-configSectionHint' }, t('config.learningSignalsEmpty'))
+        : h('ul', { key: 'signals', className: 'dshr-signalList' }, signals.map(function renderSignal(signal, index) {
+          const kind = str(signal.kind);
+          const from = signal.from === undefined || signal.from === null ? '' : String(signal.from);
+          const to = signal.to === undefined || signal.to === null ? '' : String(signal.to);
+          const transition = from !== '' || to !== '' ? t('config.signalFromTo', { from: from, to: to }) : '';
+          return h('li', { key: str(signal.itemId) + ':' + index, className: 'dshr-signal' },
+            h('span', { className: 'dshr-signalKind' }, signalKindLabel(t, kind)),
+            h('span', { className: 'dshr-signalTitle', title: str(signal.title) }, str(signal.title) || t('toast.unknownItem')),
+            transition ? h('span', { className: 'dshr-signalTransition' }, transition) : null,
+            h('span', { className: 'dshr-signalTime' }, formatRelative(signal.at, t))
+          );
+        }));
+      const learningActions = h('div', { className: 'dshr-configActions' },
+        h('button', {
+          type: 'button',
+          className: 'dshr-btn',
+          disabled: learningDisabled || signals.length === 0,
+          onClick: function clearSignals() {
+            runAction('learning.clearSignals', {}, 'clearSignals', 'config.learningSaveFailed');
+          },
+        }, t('config.clearSignals')),
+        confirmReset
+          ? [
+            h('span', { key: 'hint', className: 'dshr-configSectionHint' }, t('config.resetHint')),
+            h('button', {
+              key: 'confirm',
+              type: 'button',
+              className: 'dshr-btn dshr-btn--danger',
+              disabled: learningDisabled,
+              onClick: function resetLearning() {
+                runAction('learning.reset', {}, 'reset', 'config.learningSaveFailed');
+                setConfirmReset(false);
+              },
+            }, t('config.resetConfirm')),
+            h('button', {
+              key: 'cancel',
+              type: 'button',
+              className: 'dshr-btn dshr-btn--ghost',
+              disabled: learningDisabled,
+              onClick: function cancelReset() { setConfirmReset(false); },
+            }, t('action.cancel'))
+          ]
+          : h('button', {
+            type: 'button',
+            className: 'dshr-btn dshr-btn--ghost dshr-btn--danger',
+            disabled: learningDisabled,
+            onClick: function askReset() { setConfirmReset(true); },
+          }, t('config.resetLearning'))
+      );
+      const learningSection = [
+        h('div', { key: 'head', className: 'dshr-configSectionHead' },
+          h('h3', { className: 'dshr-configSectionTitle' }, t('config.learningTitle')),
+          h('p', { className: 'dshr-configSectionHint' }, t('config.learningHint'))
+        ),
+        h('div', { key: 'notes', className: 'dshr-configNoteField' },
+          h('span', { className: 'dshr-label' }, t('config.learningNotes')),
+          h('textarea', {
+            className: 'dshr-textarea',
+            value: notesDraft,
+            placeholder: t('config.learningNotesPlaceholder'),
+            'aria-label': t('config.learningNotes'),
+            disabled: learningDisabled,
+            onChange: function onChange(event) { setNotesDraft(event.target.value); },
+          }),
+          h('div', { className: 'dshr-configActions' },
+            h('button', {
+              type: 'button',
+              className: 'dshr-btn dshr-btn--small',
+              disabled: learningDisabled,
+              onClick: function saveNotes() { saveLearning({ notes: notesDraft }, 'notes'); },
+            }, t('config.learningSave'))
+          )
+        ),
+        h('div', { key: 'biases', className: 'dshr-configRows' }, learnedRows),
+        h('div', { key: 'groups', className: 'dshr-configSectionHead' },
+          h('h3', { className: 'dshr-configSectionTitle' }, t('config.learnedGroups'))
+        ),
+        groupsBlock,
+        h('div', { key: 'signalsHead', className: 'dshr-configSectionHead' },
+          h('h3', { className: 'dshr-configSectionTitle' }, t('config.learningSignals'))
+        ),
+        signalsBlock,
+        h('div', { key: 'actions', className: 'dshr-configActionsRow' }, learningActions)
+      ];
+      body.push(h('div', { key: 'learning', className: 'dshr-configSection' }, learningSection));
+
       const foot = [];
       if (saved && !error) foot.push(h('span', { key: 'saved', className: 'dshr-configSaved' }, t('config.saved')));
       foot.push(h('span', { key: 'auto' }, t('config.autoSave')));
@@ -2278,6 +2903,41 @@ window.__ModuleLoader__.load({
       .dshr-configSaved{color:var(--dsw-alias-state-success-primary)}
       .dshr-configSummary{font-size:13px;line-height:20px;color:var(--dsw-alias-label-secondary)}
       .dshr-configInfo{max-width:190px;text-align:right;font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary)}
+      .dshr-configSection{display:flex;flex-direction:column;gap:8px;padding-top:10px;border-top:.5px solid var(--dsw-alias-border-l4)}
+      .dshr-configSectionHead{display:flex;flex-direction:column;gap:1px;min-width:0}
+      .dshr-configSectionTitle{margin:0;font-size:13px;font-weight:500;line-height:20px;color:var(--dsw-alias-label-primary)}
+      .dshr-configSectionHint{margin:0;font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary)}
+      .dshr-configInfoLine{margin:0;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);font-variant-numeric:tabular-nums}
+      .dshr-configErrorBlock{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px}
+      .dshr-configError{margin:0;color:var(--dsw-alias-state-error-primary);font-size:12px;line-height:18px}
+      .dshr-configNumber{width:78px;height:28px;font-size:12px;text-align:right;font-variant-numeric:tabular-nums}
+      .dshr-configNoteField{display:flex;flex-direction:column;gap:6px}
+      .dshr-configGroups{display:flex;flex-direction:column;padding:0 14px;border:.5px solid var(--dsw-alias-border-l3);border-radius:12px}
+      .dshr-configGroup{display:grid;grid-template-columns:minmax(0,1fr) auto auto auto;align-items:center;gap:8px;padding:6px 0;border-bottom:.5px solid var(--dsw-alias-border-l3)}
+      .dshr-configGroup:last-child{border-bottom:0}
+      .dshr-configGroupName{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;line-height:20px;color:var(--dsw-alias-label-primary)}
+      .dshr-configGroupSamples{font-size:12px;line-height:18px;color:var(--dsw-alias-label-caption);white-space:nowrap;font-variant-numeric:tabular-nums}
+      .dshr-configActions{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
+      .dshr-configActionsRow{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
+      .dshr-signalList{display:flex;flex-direction:column;gap:4px;margin:0;padding:0;list-style:none}
+      .dshr-signal{display:flex;flex-wrap:wrap;align-items:center;gap:2px 8px;font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary)}
+      .dshr-signalKind{color:var(--dsw-alias-label-secondary);font-weight:500}
+      .dshr-signalTitle{max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-secondary)}
+      .dshr-signalTransition{color:var(--dsw-alias-label-tertiary);font-variant-numeric:tabular-nums}
+      .dshr-signalTime{color:var(--dsw-alias-label-caption)}
+      .dshr-attentionBadge{flex:none;padding:0 6px;border:.5px solid var(--dsw-alias-border-l2);border-radius:999px;font-size:11px;line-height:16px;white-space:nowrap;color:var(--dsw-alias-label-secondary)}
+      .dshr-attentionBadge[data-level=high]{color:var(--dsw-alias-state-error-primary);border-color:var(--dsw-alias-state-error-primary)}
+      .dshr-attentionBadge[data-level=medium]{color:var(--dsw-alias-state-warn-primary);border-color:var(--dsw-alias-state-warn-primary)}
+      .dshr-rowSubtitle{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;margin-top:1px;font-size:13px;line-height:19px;color:var(--dsw-alias-label-tertiary);overflow-wrap:anywhere}
+      .dshr-rowStatusNote{max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;line-height:18px;color:var(--dsw-alias-state-warn-primary)}
+      .dshr-statusDot[data-status=awaiting]{background:var(--dsw-alias-state-warn-primary)}
+      .dshr-autoBlock{display:flex;flex-direction:column;gap:3px;margin:0 0 16px;padding:10px 12px;border:.5px solid var(--dsw-alias-border-l3);border-radius:12px;background:var(--dsw-alias-bg-layer-1)}
+      .dshr-autoHead{display:flex;align-items:center;justify-content:space-between;gap:8px}
+      .dshr-autoLine{margin:0;font-size:12px;line-height:18px;color:var(--dsw-alias-label-secondary);font-variant-numeric:tabular-nums}
+      .dshr-autoReason{margin:0;font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary);overflow-wrap:anywhere}
+      .dshr-autoHint{margin:2px 0 0;font-size:12px;line-height:18px;color:var(--dsw-alias-label-caption)}
+      .dshr-autoNotice{margin:0;font-size:12px;line-height:18px;color:var(--dsw-alias-state-success-primary)}
+      .dshr-lockedLine{margin:2px 0 0;font-size:12px;line-height:18px;color:var(--dsw-alias-state-warn-primary);overflow-wrap:anywhere}
       .dshr-detail{display:flex;flex-direction:column;flex:0 0 380px;min-width:0;min-height:0;border-left:.5px solid var(--dsw-alias-border-l4);background:var(--dsw-alias-bg-base)}
       .dshr-detailBody{display:flex;flex-direction:column;flex:1;min-width:0;min-height:0}
       .dshr-detailHeader{display:flex;align-items:center;gap:8px;flex:none;padding:14px 20px;border-bottom:.5px solid var(--dsw-alias-border-l3)}
@@ -2337,7 +2997,7 @@ window.__ModuleLoader__.load({
       .dshr-kindBadge[data-kind=updated]{color:var(--dsw-alias-state-business-primary)}
       .dshr-kindBadge[data-kind=attention]{color:var(--dsw-alias-state-warn-primary)}
       .dshr-changeTitle{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;font-weight:500;line-height:18px}
-            .dshr-changeActions{display:flex;flex:none;justify-content:flex-end;gap:1px;margin-left:auto}
+      .dshr-changeActions{display:flex;flex:none;justify-content:flex-end;gap:1px;margin-left:auto}
       .dshr-changeTop{display:flex;align-items:center;gap:6px;min-width:0}
       .dshr-changeDetail{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;margin:0;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:17px;overflow-wrap:anywhere}
       .dshr-toastFooter{display:flex;flex-wrap:wrap;align-items:center;justify-content:flex-end;gap:6px;margin-top:9px;padding-top:8px;border-top:.5px solid var(--dsw-alias-border-l2)}

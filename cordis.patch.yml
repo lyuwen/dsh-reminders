@@ -13,6 +13,10 @@
 #   maxSessions               number   default 12
 #   staleHours                number   default 24
 #   forgetHours               number   default 72
+#   evalMode                  string   default model  (model | heuristic)
+#   evalProvider/evalModel    string   default ''     (empty = follow default model)
+#   evalMaxSessions           number   default 8
+#   evalMaxItems              number   default 20
 #   dataDir                   string   default $DSH_HOME/reminders
 - insert:
     - id: reminders
@@ -20,3 +24,8 @@
       config:
         dreamEnabled: true
         dreamIntervalMinutes: 10
+        # LLM evaluation of progress/importance/attention; deterministic fallback
+        # when no route is available. Runtime changes live in the plugin UI.
+        evalMode: model
+        evalMaxSessions: 8
+        evalMaxItems: 20

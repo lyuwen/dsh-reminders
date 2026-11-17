@@ -20,7 +20,8 @@
 import { stat, mkdir, readFile, rename, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
+import { DreamEvaluator, heuristicAttention, heuristicStatus, heuristicSubtitle } from './evaluate.js'
 
 export const name = 'reminders'
 export const inject = ['tools']
@@ -39,10 +40,27 @@ const ACTIVITY_KEEP = 12
 /** Changes retained per activity rollup (the long-absence aggregate). */
 const ROLLUP_CHANGES_KEEP = 60
 const SESSION_META_KEEP = 400
+const SESSION_SUMMARY_KEEP = 400
+const LEARNING_SIGNALS_KEEP = 60
 const MAX_TITLE = 200
 const MAX_TEXT = 4000
 const MAX_NEXT_STEP = 400
-const STATUSES = ['todo', 'doing', 'blocked', 'done']
+const MAX_SUBTITLE = 300
+const MAX_STATUS_NOTE = 200
+const STATUSES = ['todo', 'doing', 'awaiting', 'blocked', 'done']
+/** Fields a user edit locks against automatic re-grading. */
+const MANUAL_FIELDS = ['title', 'subtitle', 'progress', 'importance']
+/** Attention score at/above which an item is surfaced to the user. */
+const ATTENTION_THRESHOLD = 60
+/** How long an attention flag is remembered so one item is not re-reported each pass. */
+const ATTENTION_REFLAG_MS = 6 * 3_600_000
+const EVAL_DEFAULTS = {
+  evalMode: 'model',
+  evalProvider: '',
+  evalModel: '',
+  evalMaxSessions: 8,
+  evalMaxItems: 20,
+}
 
 /** A user-visible operation failure with a stable code. */
 class ReminderError extends Error {
@@ -176,6 +194,30 @@ function groupNameForCwd(cwd) {
 }
 
 /**
+ * Stable fingerprint for the parts of a Session that change its evaluation.
+ * @param {unknown} value
+ */
+function fingerprintOf(value) {
+  return createHash('sha1').update(JSON.stringify(value)).digest('hex')
+}
+
+/**
+ * Empty learned-preference record.
+ */
+function emptyLearning() {
+  return {
+    updatedAt: 0,
+    notes: '',
+    importanceBias: 0,
+    progressBias: 0,
+    attentionBias: 0,
+    groups: [],
+    signals: [],
+    stats: { edits: 0, deletes: 0, pins: 0, attentionKept: 0, attentionDismissed: 0 },
+  }
+}
+
+/**
  * Join the text blocks of a stored message.
  * @param {{content?: Array<{type?:string,text?:string}>}|undefined} message
  * @param {number} max
@@ -245,7 +287,8 @@ function deriveSessionState(lastEvent) {
 }
 
 /**
- * Extract the research surface of one Session from its event sample.
+ * Extract the research surface of one Session from its event sample, including
+ * whether the Session is currently waiting on the user.
  * @param {Array<object>} events
  */
 function analyzeEvents(events) {
@@ -257,6 +300,9 @@ function analyzeEvents(events) {
   let turnEnds = 0
   let lastTime = 0
   let lastEvent
+  let lastApprovalAsked = 0
+  let lastApprovalDecided = 0
+  const pendingCalls = new Map()
   const tools = []
   for (const event of events) {
     if (!event || typeof event !== 'object') continue
@@ -278,14 +324,26 @@ function analyzeEvents(events) {
       }
       case 'tool/call': {
         const toolName = typeof event.data?.name === 'string' ? event.data.name : ''
+        const callId = typeof event.data?.callId === 'string' ? event.data.callId : ''
+        if (callId && toolName) pendingCalls.set(callId, toolName)
         if (toolName && !tools.includes(toolName) && tools.length < 8) tools.push(toolName)
         break
       }
       case 'tool/result': {
+        const callId = event.data?.message?.toolCallId ?? event.data?.message?.source?.callId
+        if (typeof callId === 'string') pendingCalls.delete(callId)
         if (event.data?.error) {
           const reason = event.data.error.reason || event.data.error.code || event.data.error.name
           if (reason) lastError = cleanLine(reason, 160)
         }
+        break
+      }
+      case 'approval/asked': {
+        lastApprovalAsked = Math.max(lastApprovalAsked, typeof event.seq === 'number' ? event.seq : 0)
+        break
+      }
+      case 'approval/decided': {
+        lastApprovalDecided = Math.max(lastApprovalDecided, typeof event.seq === 'number' ? event.seq : 0)
         break
       }
       case 'turn/end': {
@@ -300,10 +358,18 @@ function analyzeEvents(events) {
         break
     }
   }
+  const pendingQuestions = [...pendingCalls.values()].filter((name) => name === 'ask_user_question' || name === 'ask_user')
+  const pendingApproval = lastApprovalAsked > lastApprovalDecided
+  const pendingIssue = pendingApproval ? 'permission' : pendingQuestions.length > 0 ? 'question' : ''
   return {
     firstUserText, lastUserText, lastAssistantText, title, lastError, turnEnds, lastTime, lastEvent,
     tools,
-    state: deriveSessionState(lastEvent),
+    pendingApproval,
+    pendingQuestion: pendingQuestions.length > 0,
+    pendingIssue,
+    lastApprovalAsked,
+    lastApprovalDecided,
+    state: pendingIssue ? 'awaiting' : deriveSessionState(lastEvent),
   }
 }
 
@@ -331,6 +397,111 @@ function suggestedProgress(summary) {
   return clamp(Math.round(progress), 10, 85)
 }
 
+/**
+ * Learned adjustment for one group/field.
+ * @param {object} learning @param {string} groupName @param {'importance'|'attention'} field
+ */
+function learnedGroupBias(learning, groupName, field) {
+  const key = groupKey(groupName)
+  const group = (learning?.groups ?? []).find((entry) => groupKey(entry.name) === key)
+  if (!group) return 0
+  return Number(field === 'attention' ? group.attentionBias : group.importanceBias) || 0
+}
+
+/**
+ * Deterministic attention for one item, including learned and group biases.
+ * @param {object} item @param {object} learning @param {string} groupName @param {number} now
+ */
+function attentionForItem(item, learning, groupName, now) {
+  return heuristicAttention({
+    item,
+    now,
+    learning,
+    groupAttentionBias: learnedGroupBias(learning, groupName, 'attention'),
+  })
+}
+
+/**
+ * Deterministic subtitle for an item without a fresh session evaluation.
+ * @param {object} item
+ */
+function fallbackSubtitle(item) {
+  return cleanLine(item.nextStep, 200) || cleanLine(item.notes, 200) || ''
+}
+
+/**
+ * Coerce a persisted learned-preference record.
+ * @param {unknown} raw
+ */
+function normalizeLearning(raw) {
+  const base = emptyLearning()
+  if (!raw || typeof raw !== 'object') return base
+  const value = /** @type {Record<string, any>} */ (raw)
+  const groups = Array.isArray(value.groups)
+    ? value.groups.filter((group) => group && typeof group === 'object' && typeof group.name === 'string')
+      .slice(0, 40)
+      .map((group) => ({
+        name: cleanLine(group.name, 60),
+        samples: numberOr(group.samples, 0, 0, 100_000),
+        importanceBias: clamp(Number(group.importanceBias) || 0, -2, 2),
+        attentionBias: clamp(Number(group.attentionBias) || 0, -20, 20),
+      }))
+      .filter((group) => group.name.length > 0)
+    : []
+  const signals = Array.isArray(value.signals)
+    ? value.signals.filter((signal) => signal && typeof signal === 'object').slice(0, LEARNING_SIGNALS_KEEP).map((signal) => ({
+        at: numberOr(signal.at, 0, 0, Number.MAX_SAFE_INTEGER),
+        kind: cleanLine(signal.kind, 30),
+        itemId: typeof signal.itemId === 'string' ? signal.itemId : '',
+        title: cleanLine(signal.title, MAX_TITLE),
+        field: cleanLine(signal.field, 30),
+        from: typeof signal.from === 'number' || typeof signal.from === 'string' ? signal.from : null,
+        to: typeof signal.to === 'number' || typeof signal.to === 'string' ? signal.to : null,
+      }))
+    : []
+  const stats = value.stats && typeof value.stats === 'object' ? value.stats : {}
+  return {
+    updatedAt: numberOr(value.updatedAt, 0, 0, Number.MAX_SAFE_INTEGER),
+    notes: cleanText(value.notes, MAX_TEXT),
+    importanceBias: clamp(Number(value.importanceBias) || 0, -2, 2),
+    progressBias: numberOr(value.progressBias, 0, -20, 20),
+    attentionBias: numberOr(value.attentionBias, 0, -20, 20),
+    groups,
+    signals,
+    stats: {
+      edits: numberOr(stats.edits, 0, 0, 1_000_000),
+      deletes: numberOr(stats.deletes, 0, 0, 1_000_000),
+      pins: numberOr(stats.pins, 0, 0, 1_000_000),
+      attentionKept: numberOr(stats.attentionKept, 0, 0, 1_000_000),
+      attentionDismissed: numberOr(stats.attentionDismissed, 0, 0, 1_000_000),
+    },
+  }
+}
+
+/**
+ * Coerce one cached Session evaluation.
+ * @param {unknown} raw
+ */
+function normalizeSessionSummary(raw) {
+  if (!raw || typeof raw !== 'object') return null
+  const value = /** @type {Record<string, any>} */ (raw)
+  if (typeof value.id !== 'string' || typeof value.fingerprint !== 'string') return null
+  return {
+    id: value.id,
+    fingerprint: value.fingerprint,
+    title: cleanLine(value.title, MAX_TITLE),
+    subtitle: cleanLine(value.subtitle, MAX_SUBTITLE),
+    progress: numberOr(value.progress, 0, 0, 100),
+    importance: numberOr(value.importance, 3, 1, 5),
+    status: STATUSES.includes(value.status) ? value.status : 'doing',
+    attention: numberOr(value.attention, 0, 0, 100),
+    attentionReason: cleanLine(value.attentionReason, MAX_STATUS_NOTE),
+    groupName: cleanLine(value.groupName, 60),
+    generatedAt: numberOr(value.generatedAt, 0, 0, Number.MAX_SAFE_INTEGER),
+    model: typeof value.model === 'string' ? cleanLine(value.model, 120) : null,
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Durable store
 // ---------------------------------------------------------------------------
@@ -349,10 +520,17 @@ function emptyState(defaults) {
       staleHours: defaults.staleHours,
       forgetHours: defaults.forgetHours,
       maxSessions: defaults.maxSessions,
+      evalMode: defaults.evalMode,
+      evalProvider: defaults.evalProvider,
+      evalModel: defaults.evalModel,
+      evalMaxSessions: defaults.evalMaxSessions,
+      evalMaxItems: defaults.evalMaxItems,
     },
     groups: [],
     items: [],
     sessionMeta: {},
+    sessionSummaries: {},
+    learning: emptyLearning(),
     activities: [],
     activityRollup: null,
     lastDreamAt: 0,
@@ -388,6 +566,17 @@ function normalizeItem(raw) {
     updatedAt: numberOr(value.updatedAt, nowMs(), 0, Number.MAX_SAFE_INTEGER),
     lastTouched: numberOr(value.lastTouched, value.updatedAt ?? nowMs(), 0, Number.MAX_SAFE_INTEGER),
     lastDreamBatchId: typeof value.lastDreamBatchId === 'string' ? value.lastDreamBatchId : undefined,
+    subtitle: cleanLine(value.subtitle, MAX_SUBTITLE),
+    statusNote: cleanLine(value.statusNote, MAX_STATUS_NOTE),
+    attentionScore: numberOr(value.attentionScore, 0, 0, 100),
+    attentionReason: cleanLine(value.attentionReason, MAX_STATUS_NOTE),
+    attentionUpdatedAt: numberOr(value.attentionUpdatedAt, 0, 0, Number.MAX_SAFE_INTEGER),
+    lastAttentionFlagAt: numberOr(value.lastAttentionFlagAt, 0, 0, Number.MAX_SAFE_INTEGER),
+    manualFields: Array.isArray(value.manualFields)
+      ? [...new Set(value.manualFields.filter((field) => MANUAL_FIELDS.includes(field)))]
+      : [],
+    lastAutoImportance: numberOr(value.lastAutoImportance, 3, 1, 5),
+    lastAutoProgress: numberOr(value.lastAutoProgress, value.progress ?? 0, 0, 100),
   }
 }
 
@@ -464,6 +653,10 @@ function normalizeActivity(raw) {
     error: typeof value.error === 'string' ? cleanLine(value.error, 400) : undefined,
     undoable: boolOr(value.undoable, false),
     undone: boolOr(value.undone, false),
+    evaluated: numberOr(value.evaluated, 0, 0, 10_000),
+    graded: numberOr(value.graded, 0, 0, 10_000),
+    model: typeof value.model === 'string' ? cleanLine(value.model, 120) : null,
+    degraded: boolOr(value.degraded, false),
     changes: normalizeChanges(value.changes, 100),
     undo: value.undo && typeof value.undo === 'object' && Array.isArray(value.undo.items) && Array.isArray(value.undo.groups)
       ? { items: value.undo.items, groups: value.undo.groups }
@@ -487,6 +680,13 @@ function normalizeState(raw, defaults) {
     if (!item.groupId || !knownGroups.has(item.groupId)) item.groupId = fallbackGroup.id
   }
   const settings = value.settings && typeof value.settings === 'object' ? value.settings : {}
+  const sessionSummaries = {}
+  if (value.sessionSummaries && typeof value.sessionSummaries === 'object') {
+    for (const entry of Object.values(value.sessionSummaries)) {
+      const summary = normalizeSessionSummary(entry)
+      if (summary) sessionSummaries[summary.id] = summary
+    }
+  }
   const sessionMeta = {}
   if (value.sessionMeta && typeof value.sessionMeta === 'object') {
     for (const [id, meta] of Object.entries(value.sessionMeta)) {
@@ -512,10 +712,17 @@ function normalizeState(raw, defaults) {
       staleHours: numberOr(settings.staleHours, defaults.staleHours, 1, 720),
       forgetHours: numberOr(settings.forgetHours, defaults.forgetHours, 1, 2160),
       maxSessions: numberOr(settings.maxSessions, defaults.maxSessions, 1, 50),
+      evalMode: settings.evalMode === 'heuristic' ? 'heuristic' : defaults.evalMode,
+      evalProvider: cleanLine(settings.evalProvider, 120),
+      evalModel: cleanLine(settings.evalModel, 120),
+      evalMaxSessions: numberOr(settings.evalMaxSessions, defaults.evalMaxSessions, 1, 30),
+      evalMaxItems: numberOr(settings.evalMaxItems, defaults.evalMaxItems, 0, 40),
     },
     groups,
     items,
     sessionMeta,
+    sessionSummaries,
+    learning: normalizeLearning(value.learning),
     activities: Array.isArray(value.activities) ? value.activities.map(normalizeActivity).filter(Boolean).slice(0, ACTIVITY_KEEP) : [],
     activityRollup: normalizeRollup(value.activityRollup),
     lastDreamAt: numberOr(value.lastDreamAt, 0, 0, Number.MAX_SAFE_INTEGER),
@@ -547,6 +754,7 @@ class ReminderStore {
     this.ready = this.#load()
     this.writeChain = Promise.resolve()
     this.engineRunning = false
+    this.evaluator = null
   }
 
   async #load() {
@@ -715,6 +923,176 @@ class ReminderStore {
     }
   }
 
+  /** Client-facing learned-preference snapshot. */
+  learningView() {
+    const learning = this.state.learning
+    return {
+      updatedAt: learning.updatedAt,
+      notes: learning.notes,
+      importanceBias: learning.importanceBias,
+      progressBias: learning.progressBias,
+      attentionBias: learning.attentionBias,
+      groups: learning.groups.map((group) => ({ ...group })),
+      signals: learning.signals.slice(0, 30).map((signal) => ({ ...signal })),
+      stats: { ...learning.stats },
+    }
+  }
+
+  /** @param {{kind:string,itemId?:string,title?:string,field?:string,from?:unknown,to?:unknown,group?:string}} signal */
+  recordLearningSignal(signal) {
+    const learning = this.state.learning
+    const entry = {
+      at: nowMs(),
+      kind: cleanLine(signal.kind, 30) || 'edit',
+      itemId: typeof signal.itemId === 'string' ? signal.itemId : '',
+      title: cleanLine(signal.title, MAX_TITLE),
+      field: cleanLine(signal.field, 30),
+      from: typeof signal.from === 'number' || typeof signal.from === 'string' ? signal.from : null,
+      to: typeof signal.to === 'number' || typeof signal.to === 'string' ? signal.to : null,
+    }
+    learning.signals.unshift(entry)
+    if (learning.signals.length > LEARNING_SIGNALS_KEEP) learning.signals = learning.signals.slice(0, LEARNING_SIGNALS_KEEP)
+    learning.updatedAt = entry.at
+    return entry
+  }
+
+  /** @param {string} name */
+  learningGroup(name) {
+    const key = groupKey(name)
+    let group = this.state.learning.groups.find((entry) => groupKey(entry.name) === key)
+    if (!group) {
+      group = { name: cleanLine(name, 60) || DEFAULT_GROUP_NAME, samples: 0, importanceBias: 0, attentionBias: 0 }
+      this.state.learning.groups.push(group)
+    }
+    return group
+  }
+
+  /** @param {object} item */
+  groupNameOf(item) {
+    return this.findGroup(item?.groupId)?.name || DEFAULT_GROUP_NAME
+  }
+
+  /**
+   * Fold one manual edit into the learned-preference record.
+   * @param {object} before @param {object} after
+   */
+  learnFromEdit(before, after) {
+    const learning = this.state.learning
+    const group = this.learningGroup(this.groupNameOf(after))
+    learning.stats.edits += 1
+    const add = (kind, field, from, to) => {
+      if (from === to) return
+      this.recordLearningSignal({ kind, itemId: after.id, title: after.title, field, from, to, group: group.name })
+    }
+    if (before.importance !== after.importance) {
+      const baseline = typeof before.lastAutoImportance === 'number' ? before.lastAutoImportance : 3
+      const delta = after.importance - baseline
+      learning.importanceBias = clamp(Math.round((learning.importanceBias * 0.85 + delta * 0.15) * 10) / 10, -2, 2)
+      group.importanceBias = clamp(Math.round((group.importanceBias * 0.85 + delta * 0.15) * 10) / 10, -2, 2)
+      group.samples += 1
+      add('importance', 'importance', before.importance, after.importance)
+      if ((before.attentionScore ?? 0) >= ATTENTION_THRESHOLD) learning.stats.attentionKept += 1
+    }
+    if (before.progress !== after.progress) {
+      const baseline = typeof before.lastAutoProgress === 'number' ? before.lastAutoProgress : before.progress
+      const delta = after.progress - baseline
+      learning.progressBias = clamp(Math.round(learning.progressBias * 0.85 + delta * 0.15), -20, 20)
+      add('progress', 'progress', before.progress, after.progress)
+    }
+    if (before.status !== after.status) add('status', 'status', before.status, after.status)
+    if (before.title !== after.title) add('title', 'title', before.title, after.title)
+    if ((before.subtitle ?? '') !== (after.subtitle ?? '')) add('subtitle', 'subtitle', before.subtitle ?? '', after.subtitle ?? '')
+    if (before.pinned !== after.pinned) {
+      if (after.pinned) learning.stats.pins += 1
+      add('pin', 'pinned', before.pinned, after.pinned)
+    }
+    learning.updatedAt = nowMs()
+  }
+
+  /** @param {object} item */
+  learnFromDelete(item) {
+    const learning = this.state.learning
+    learning.stats.deletes += 1
+    const group = this.learningGroup(this.groupNameOf(item))
+    if ((item.attentionScore ?? 0) >= ATTENTION_THRESHOLD) {
+      learning.stats.attentionDismissed += 1
+      learning.attentionBias = clamp(learning.attentionBias - 1, -20, 20)
+      group.attentionBias = clamp(group.attentionBias - 1, -20, 20)
+    }
+    this.recordLearningSignal({
+      kind: 'delete',
+      itemId: item.id,
+      title: item.title,
+      field: '',
+      from: item.status,
+      to: 'deleted',
+      group: group.name,
+    })
+    learning.updatedAt = nowMs()
+  }
+
+  /** @param {Record<string, any>} patch */
+  updateLearning(patch) {
+    const learning = this.state.learning
+    const input = patch && typeof patch === 'object' ? patch : {}
+    if (typeof input.notes === 'string') learning.notes = cleanText(input.notes, MAX_TEXT)
+    if (typeof input.importanceBias === 'number' && Number.isFinite(input.importanceBias)) {
+      learning.importanceBias = clamp(input.importanceBias, -2, 2)
+    }
+    if (typeof input.progressBias === 'number' && Number.isFinite(input.progressBias)) {
+      learning.progressBias = numberOr(input.progressBias, learning.progressBias, -20, 20)
+    }
+    if (typeof input.attentionBias === 'number' && Number.isFinite(input.attentionBias)) {
+      learning.attentionBias = numberOr(input.attentionBias, learning.attentionBias, -20, 20)
+    }
+    if (Array.isArray(input.groups)) {
+      for (const raw of input.groups.slice(0, 40)) {
+        if (!raw || typeof raw !== 'object' || typeof raw.name !== 'string') continue
+        const group = this.learningGroup(raw.name)
+        if (Object.prototype.hasOwnProperty.call(raw, 'importanceBias')) {
+          group.importanceBias = clamp(Number(raw.importanceBias) || 0, -2, 2)
+        }
+        if (Object.prototype.hasOwnProperty.call(raw, 'attentionBias')) {
+          group.attentionBias = numberOr(raw.attentionBias, group.attentionBias, -20, 20)
+        }
+      }
+    }
+    learning.updatedAt = nowMs()
+    this.touch()
+    return this.learningView()
+  }
+
+  /** Clear every learned preference. */
+  resetLearning() {
+    this.state.learning = emptyLearning()
+    this.touch()
+    return this.learningView()
+  }
+
+  /** Drop the recent-signal log but keep notes/biases. */
+  clearLearningSignals() {
+    this.state.learning.signals = []
+    this.state.learning.updatedAt = nowMs()
+    this.touch()
+    return this.learningView()
+  }
+
+  /** @param {string} id */
+  getSessionSummary(id) {
+    return this.state.sessionSummaries[id] ?? null
+  }
+
+  /** @param {object} entry */
+  putSessionSummary(entry) {
+    this.state.sessionSummaries[entry.id] = entry
+    const entries = Object.values(this.state.sessionSummaries)
+    if (entries.length > SESSION_SUMMARY_KEEP) {
+      entries.sort((a, b) => (b.generatedAt || 0) - (a.generatedAt || 0))
+      this.state.sessionSummaries = Object.fromEntries(entries.slice(0, SESSION_SUMMARY_KEEP).map((summary) => [summary.id, summary]))
+    }
+    this.touch()
+  }
+
   /** @param {number} now */
   snapshot(now = nowMs()) {
     const settings = this.state.settings
@@ -732,7 +1110,23 @@ class ReminderStore {
         staleHours: settings.staleHours,
         forgetHours: settings.forgetHours,
         maxSessions: settings.maxSessions,
+        evalMode: settings.evalMode,
+        evalProvider: settings.evalProvider,
+        evalModel: settings.evalModel,
+        evalMaxSessions: settings.evalMaxSessions,
+        evalMaxItems: settings.evalMaxItems,
       },
+      evaluation: this.evaluator ? this.evaluator.evaluationView(settings) : {
+        mode: settings.evalMode,
+        enabled: false,
+        provider: settings.evalProvider,
+        model: settings.evalModel,
+        followsDefault: !(settings.evalProvider && settings.evalModel),
+        available: false,
+        lastModel: null,
+        lastDegraded: false,
+      },
+      learning: this.learningView(),
       groups: this.state.groups.map((group) => ({ id: group.id, name: group.name, createdAt: group.createdAt })),
       items: this.state.items.map((item) => this.itemView(item, now)),
       activities: activities.map((activity) => this.activityView(activity)),
@@ -784,19 +1178,35 @@ class ReminderStore {
       : this.groupForName(payload?.group ?? DEFAULT_GROUP_NAME).group
     if (!group) throw new ReminderError('not_found', 'The selected group does not exist.')
     const status = STATUSES.includes(payload?.status) ? payload.status : 'todo'
+    const progress = numberOr(payload?.progress, status === 'done' ? 100 : 0, 0, 100)
+    const importance = numberOr(payload?.importance, 3, 1, 5)
+    const subtitle = cleanLine(payload?.subtitle, MAX_SUBTITLE)
+    const manualFields = ['title']
+    if (subtitle) manualFields.push('subtitle')
+    if (payload && typeof payload.progress === 'number' && Number.isFinite(payload.progress)) manualFields.push('progress')
+    if (payload && typeof payload.importance === 'number' && Number.isFinite(payload.importance)) manualFields.push('importance')
     const item = {
       id: newId('r'),
       title,
+      subtitle,
       notes: cleanText(payload?.notes, MAX_TEXT),
       nextStep: cleanLine(payload?.nextStep, MAX_NEXT_STEP),
       groupId: group.id,
       status,
-      progress: numberOr(payload?.progress, status === 'done' ? 100 : 0, 0, 100),
-      importance: numberOr(payload?.importance, 3, 1, 5),
+      statusNote: '',
+      progress,
+      importance,
       pinned: boolOr(payload?.pinned, false),
       source: 'manual',
       autoManaged: false,
       sessionIds: [],
+      attentionScore: 0,
+      attentionReason: '',
+      attentionUpdatedAt: 0,
+      lastAttentionFlagAt: 0,
+      manualFields: [...new Set(manualFields)],
+      lastAutoImportance: importance,
+      lastAutoProgress: progress,
       createdAt: now,
       updatedAt: now,
       lastTouched: now,
@@ -813,33 +1223,75 @@ class ReminderStore {
   updateItem(id, patch) {
     const item = this.findItem(id)
     if (!item) throw new ReminderError('not_found', 'That reminder no longer exists.')
+    const before = structuredClone(item)
     const next = patch && typeof patch === 'object' ? patch : {}
-    if (Object.prototype.hasOwnProperty.call(next, 'title')) {
+    const has = (key) => Object.prototype.hasOwnProperty.call(next, key)
+    const lock = (field) => {
+      if (!item.manualFields.includes(field)) item.manualFields.push(field)
+    }
+    if (has('title')) {
       const title = cleanLine(next.title, MAX_TITLE)
       if (!title) throw new ReminderError('invalid', 'A reminder needs a non-empty title.')
+      if (title !== item.title) lock('title')
       item.title = title
     }
-    if (Object.prototype.hasOwnProperty.call(next, 'notes')) item.notes = cleanText(next.notes, MAX_TEXT)
-    if (Object.prototype.hasOwnProperty.call(next, 'nextStep')) item.nextStep = cleanLine(next.nextStep, MAX_NEXT_STEP)
-    if (Object.prototype.hasOwnProperty.call(next, 'groupId')) {
+    if (has('subtitle')) {
+      const subtitle = cleanLine(next.subtitle, MAX_SUBTITLE)
+      if (subtitle !== item.subtitle) {
+        if (subtitle) lock('subtitle')
+        else item.manualFields = item.manualFields.filter((field) => field !== 'subtitle')
+      }
+      item.subtitle = subtitle
+    }
+    if (has('notes')) item.notes = cleanText(next.notes, MAX_TEXT)
+    if (has('nextStep')) item.nextStep = cleanLine(next.nextStep, MAX_NEXT_STEP)
+    if (has('groupId')) {
       if (!this.findGroup(next.groupId)) throw new ReminderError('not_found', 'The selected group does not exist.')
       item.groupId = next.groupId
     }
-    if (Object.prototype.hasOwnProperty.call(next, 'status')) {
+    if (has('status')) {
       if (!STATUSES.includes(next.status)) throw new ReminderError('invalid', 'Unknown status.')
       item.status = next.status
+      if (next.status !== 'awaiting') item.statusNote = ''
       if (next.status === 'done') {
         item.progress = 100
+        item.attentionScore = 0
+        item.attentionReason = ''
       } else if (item.progress === 100) {
         item.progress = 90
       }
     }
-    if (Object.prototype.hasOwnProperty.call(next, 'progress')) item.progress = numberOr(next.progress, item.progress, 0, 100)
-    if (Object.prototype.hasOwnProperty.call(next, 'importance')) item.importance = numberOr(next.importance, item.importance, 1, 5)
-    if (Object.prototype.hasOwnProperty.call(next, 'pinned')) item.pinned = boolOr(next.pinned, item.pinned)
+    if (has('progress')) {
+      const progress = numberOr(next.progress, item.progress, 0, 100)
+      if (progress !== item.progress) lock('progress')
+      item.progress = progress
+    }
+    if (has('importance')) {
+      const importance = numberOr(next.importance, item.importance, 1, 5)
+      if (importance !== item.importance) lock('importance')
+      item.importance = importance
+    }
+    if (has('pinned')) item.pinned = boolOr(next.pinned, item.pinned)
     item.updatedAt = nowMs()
     item.lastTouched = Math.max(item.lastTouched, item.updatedAt)
     item.autoManaged = false
+    this.learnFromEdit(before, item)
+    this.touch()
+    return item
+  }
+
+  /**
+   * Restore automatic grading for some manual-locked fields.
+   * @param {string} id @param {string[]|undefined} fields
+   */
+  unlockItem(id, fields) {
+    const item = this.findItem(id)
+    if (!item) throw new ReminderError('not_found', 'That reminder no longer exists.')
+    const requested = Array.isArray(fields) && fields.length > 0
+      ? fields.filter((field) => MANUAL_FIELDS.includes(field))
+      : [...MANUAL_FIELDS]
+    item.manualFields = item.manualFields.filter((field) => !requested.includes(field))
+    item.updatedAt = nowMs()
     this.touch()
     return item
   }
@@ -848,7 +1300,9 @@ class ReminderStore {
   deleteItem(id) {
     const index = this.state.items.findIndex((item) => item.id === id)
     if (index < 0) throw new ReminderError('not_found', 'That reminder no longer exists.')
-    const [removed] = this.state.items.splice(index, 1)
+    const removed = this.state.items[index]
+    this.learnFromDelete(removed)
+    this.state.items.splice(index, 1)
     this.touch()
     return removed
   }
@@ -911,6 +1365,27 @@ class ReminderStore {
     }
     if (Object.prototype.hasOwnProperty.call(payload ?? {}, 'forgetHours')) {
       settings.forgetHours = numberOr(payload.forgetHours, settings.forgetHours, 1, 2160)
+    }
+    const input = payload && typeof payload === 'object' ? payload : {}
+    if (typeof input.evalMode === 'string') {
+      settings.evalMode = input.evalMode === 'heuristic' ? 'heuristic' : 'model'
+    }
+    if (input.evalProvider !== undefined || input.evalModel !== undefined) {
+      const provider = cleanLine(input.evalProvider, 120)
+      const model = cleanLine(input.evalModel, 120)
+      if (provider && model) {
+        settings.evalProvider = provider
+        settings.evalModel = model
+      } else {
+        settings.evalProvider = ''
+        settings.evalModel = ''
+      }
+    }
+    if (typeof input.evalMaxSessions === 'number') {
+      settings.evalMaxSessions = numberOr(input.evalMaxSessions, settings.evalMaxSessions, 1, 30)
+    }
+    if (typeof input.evalMaxItems === 'number') {
+      settings.evalMaxItems = numberOr(input.evalMaxItems, settings.evalMaxItems, 0, 40)
     }
     // "stale" must start before a reminder becomes "cold"/forgotten.
     if (settings.staleHours > settings.forgetHours) settings.forgetHours = settings.staleHours
@@ -1079,19 +1554,42 @@ class SessionScanner {
     const hasWork = Boolean(info.firstUserText || refined.lastUserText || displayTitle)
     if (!hasWork) return null
     const cwd = typeof candidate.header.cwd === 'string' ? candidate.header.cwd : undefined
+    const pendingIssue = refined.hasApprovalRecords
+      ? (refined.pendingApproval ? 'permission' : (info.pendingQuestion ? 'question' : ''))
+      : (info.pendingIssue || (refined.pendingApproval ? 'permission' : ''))
+    const sessionTitle = titleForSession({ title: displayTitle ?? '', firstUserText: info.firstUserText, lastUserText: refined.lastUserText, cwd })
+    const lastActivity = Math.max(candidate.recency ?? 0, info.lastTime ?? 0, refined.lastActivity ?? 0)
+    const state = pendingIssue ? 'awaiting' : info.state
     const summary = {
       id: candidate.id,
-      title: titleForSession({ title: displayTitle ?? '', firstUserText: info.firstUserText, lastUserText: refined.lastUserText, cwd }),
+      title: sessionTitle,
       cwd,
       groupName: groupNameForCwd(cwd),
-      lastActivity: Math.max(candidate.recency ?? 0, info.lastTime ?? 0, refined.lastActivity ?? 0),
+      lastActivity,
       firstUserText: info.firstUserText,
       lastUserText: refined.lastUserText,
       lastAssistantText: info.lastAssistantText,
       lastError: info.lastError,
       tools: info.tools,
       turnEnds: refined.turnEnds,
-      state: refined.state,
+      state,
+      pendingIssue,
+      pendingApproval: pendingIssue === 'permission',
+      pendingQuestion: pendingIssue === 'question',
+      eventCount: typeof candidate.eventCount === 'number' ? candidate.eventCount : undefined,
+      fingerprint: fingerprintOf({
+        id: candidate.id,
+        title: sessionTitle,
+        eventCount: candidate.eventCount,
+        lastActivity,
+        lastUserText: refined.lastUserText,
+        lastAssistantText: info.lastAssistantText,
+        lastError: info.lastError,
+        state,
+        pendingIssue,
+        tools: info.tools,
+        turnEnds: refined.turnEnds,
+      }),
     }
     return summary
   }
@@ -1108,6 +1606,8 @@ class SessionScanner {
       lastActivity: 0,
       lastUserText: info.lastUserText,
       state: info.state,
+      pendingApproval: info.pendingApproval,
+      hasApprovalRecords: false,
     }
     const query = this.ctx.get('sessionQuery')
     if (!query || typeof query.listEvents !== 'function') return refined
@@ -1122,6 +1622,20 @@ class SessionScanner {
     refined.turnEnds = records.reduce((count, record) => count + (record?.type === 'turn/end' ? 1 : 0), 0)
     const lastRecord = records[records.length - 1]
     if (typeof lastRecord?.time === 'number') refined.lastActivity = lastRecord.time
+    let lastAsked = 0
+    let lastDecided = 0
+    let sawApproval = false
+    for (const record of records) {
+      if (record?.type !== 'approval/asked' && record?.type !== 'approval/decided') continue
+      sawApproval = true
+      const seq = typeof record.seq === 'number' ? record.seq : 0
+      if (record.type === 'approval/asked') lastAsked = Math.max(lastAsked, seq)
+      else lastDecided = Math.max(lastDecided, seq)
+    }
+    if (sawApproval) {
+      refined.hasApprovalRecords = true
+      refined.pendingApproval = lastAsked > lastDecided
+    }
     if (!refined.lastUserText && typeof query.readEvent === 'function') {
       for (let index = records.length - 1; index >= 0; index -= 1) {
         if (records[index]?.type !== 'user/message') continue
@@ -1210,7 +1724,11 @@ class SessionScanner {
 // Dreaming engine
 // ---------------------------------------------------------------------------
 
-/** Dream planning: pure derivation of one run's operations. */
+/**
+ * Dreaming engine: scan recent Sessions, evaluate changed work (LLM when a
+ * route is available, deterministic heuristics otherwise), fold the result into
+ * the reminder list, refresh attention, and record what happened.
+ */
 class DreamEngine {
   /**
    * @param {ReminderStore} store @param {object} ctx
@@ -1220,6 +1738,8 @@ class DreamEngine {
     this.ctx = ctx
     this.scanner = new SessionScanner(ctx)
     this.current = null
+    this.evaluator = new DreamEvaluator(ctx, store)
+    store.evaluator = this.evaluator
   }
 
   get running() {
@@ -1256,6 +1776,10 @@ class DreamEngine {
       created: 0,
       updated: 0,
       attention: 0,
+      evaluated: 0,
+      graded: 0,
+      model: null,
+      degraded: false,
       summary: 'Scanning recent sessions…',
       undoable: false,
       undone: false,
@@ -1278,11 +1802,84 @@ class DreamEngine {
       })
       activity.scanned = summaries.length
       activity.summary = `Scanned ${summaries.length} session${summaries.length === 1 ? '' : 's'}…`
-      this.#applyPlan(activity, summaries, now)
+
+      const changed = []
+      for (const summary of summaries) {
+        const cached = store.getSessionSummary(summary.id)
+        summary.cached = cached && cached.fingerprint === summary.fingerprint && cached.model ? cached : null
+        if (!summary.cached) changed.push(summary)
+      }
+      const openItems = state.items.filter((item) => item.status !== 'done')
+      let sessionEvals = new Map()
+      let itemEvals = new Map()
+      let modelLabel = null
+      let degraded = false
+      let evalError = null
+      const route = settings.evalMode === 'heuristic' ? null : this.evaluator.resolveRoute(settings)
+      const sessionPayload = changed.slice(0, settings.evalMaxSessions).map((summary) => this.#sessionPayload(summary, state))
+      const itemPayload = openItems.slice(0, settings.evalMaxItems).map((item) => this.#itemPayload(item, state))
+      if (route && (sessionPayload.length > 0 || itemPayload.length > 0)) {
+        try {
+          const result = await this.evaluator.evaluate({
+            sessions: sessionPayload,
+            items: itemPayload,
+            learning: state.learning,
+            settings,
+            signal: options.signal,
+          })
+          sessionEvals = result.sessions
+          itemEvals = result.items
+          modelLabel = `${result.route.provider}/${result.route.model}`
+          activity.evaluated = sessionPayload.length
+          activity.graded = itemPayload.length
+        } catch (error) {
+          degraded = true
+          evalError = error instanceof Error ? error.message : String(error)
+        }
+      }
+      activity.model = modelLabel
+      activity.degraded = degraded
+      if (evalError) activity.error = cleanLine(evalError, 400)
+
+      const decisions = []
+      for (const summary of summaries) {
+        decisions.push(this.#decideSession(summary, sessionEvals.get(summary.id), settings, state.learning, now, modelLabel))
+      }
+      // Only model-graded summaries enter the cache; heuristic mode never poisons it.
+      if (settings.evalMode !== 'heuristic') {
+        for (const decision of decisions) {
+          if (!decision.model) continue
+          store.putSessionSummary({
+            id: decision.summary.id,
+            fingerprint: decision.summary.fingerprint,
+            title: decision.title,
+            subtitle: decision.subtitle,
+            progress: decision.progress,
+            importance: decision.importance,
+            status: decision.status,
+            attention: decision.attention ?? 0,
+            attentionReason: decision.attentionReason,
+            groupName: decision.groupName,
+            generatedAt: now,
+            model: decision.model,
+          })
+        }
+      }
+
+      const updatedItemIds = new Set()
+      for (const decision of decisions) {
+        this.#applyDecision(decision, activity, updatedItemIds, settings, state, now, itemEvals)
+      }
+      this.#applyItemGrades(activity, itemEvals, settings, state, now)
+      this.#applyHeuristicAttention(settings, state, now)
+      this.#flagAttention(activity, state, now)
+
       const parts = [`Scanned ${summaries.length} session${summaries.length === 1 ? '' : 's'}`]
       if (activity.created > 0) parts.push(`${activity.created} new`)
       if (activity.updated > 0) parts.push(`${activity.updated} updated`)
       if (activity.attention > 0) parts.push(`${activity.attention} need${activity.attention === 1 ? 's' : ''} attention`)
+      if (modelLabel) parts.push(`evaluated by ${modelLabel}`)
+      else if (settings.evalMode !== 'heuristic') parts.push(degraded ? 'heuristic fallback' : 'heuristic mode')
       activity.status = 'done'
       activity.endedAt = nowMs()
       activity.summary = parts.join(' · ')
@@ -1308,77 +1905,302 @@ class DreamEngine {
   }
 
   /**
-   * Fold scanned summaries into the reminder list.
-   * @param {object} activity @param {Array<object>} summaries @param {number} now
+   * Compact Session payload for the evaluator.
+   * @param {object} summary @param {object} state
    */
-  #applyPlan(activity, summaries, now) {
+  #sessionPayload(summary, state) {
+    return {
+      id: summary.id,
+      title: summary.title,
+      cwd: summary.cwd,
+      lastUserText: summary.lastUserText,
+      lastAssistantText: summary.lastAssistantText,
+      state: summary.state,
+      pendingIssue: summary.pendingIssue,
+      tools: summary.tools,
+      lastActivity: summary.lastActivity,
+      turnEnds: summary.turnEnds,
+      linkedItem: this.#linkedItemView(summary, state),
+    }
+  }
+
+  /**
+   * Compact item payload for the evaluator.
+   * @param {object} item @param {object} state
+   */
+  #itemPayload(item, state) {
+    return {
+      id: item.id,
+      title: item.title,
+      subtitle: item.subtitle,
+      groupName: this.store.groupNameOf(item),
+      status: item.status,
+      importance: item.importance,
+      progress: item.progress,
+      lastTouched: item.lastTouched,
+      freshness: deriveFreshness(item.lastTouched, state.settings, nowMs()),
+      pinned: item.pinned,
+      statusNote: item.statusNote,
+      manualFields: item.manualFields,
+    }
+  }
+
+  /**
+   * @param {object} summary @param {object} state
+   */
+  #linkedItemView(summary, state) {
+    const item = state.items.find((entry) => entry.sessionIds.includes(summary.id))
+    if (!item) return null
+    return {
+      id: item.id,
+      title: item.title,
+      subtitle: item.subtitle,
+      status: item.status,
+      progress: item.progress,
+      importance: item.importance,
+      manualFields: item.manualFields,
+    }
+  }
+
+  /**
+   * Final evaluation for one Session: cached, model-graded, or heuristic.
+   * @param {object} summary @param {object|undefined} llmEval @param {object} settings
+   * @param {object} learning @param {number} now @param {string|null} modelLabel
+   */
+  #decideSession(summary, llmEval, settings, learning, now, modelLabel) {
+    const cached = summary.cached
+    if (cached) {
+      const status = summary.pendingIssue ? 'awaiting' : cached.status
+      return {
+        summary,
+        title: summary.title,
+        subtitle: cached.subtitle || heuristicSubtitle(summary),
+        progress: cached.progress,
+        importance: cached.importance,
+        status,
+        statusNote: summary.pendingIssue === 'permission'
+          ? 'Waiting for your permission.'
+          : summary.pendingIssue === 'question'
+            ? 'Waiting for your answer.'
+            : (status === 'blocked' ? cleanLine(summary.lastError, 160) : ''),
+        attention: cached.attention,
+        attentionReason: summary.pendingIssue
+          ? 'Waiting for you.'
+          : (cached.attentionReason || ''),
+        groupName: cached.groupName || summary.groupName,
+        model: cached.model,
+        source: 'cache',
+      }
+    }
+    const groupName = llmEval?.group || summary.groupName || DEFAULT_GROUP_NAME
+    const groupImportanceBias = learnedGroupBias(learning, groupName, 'importance')
+    const groupAttentionBias = learnedGroupBias(learning, groupName, 'attention')
+    const hasModel = Boolean(llmEval)
+    const subtitle = (hasModel && llmEval.subtitle) || heuristicSubtitle(summary)
+    let progress = hasModel && typeof llmEval.progress === 'number'
+      ? llmEval.progress + (settings.evalMode === 'model' ? learning.progressBias : 0)
+      : suggestedProgress(summary)
+    progress = clamp(progress, 0, 100)
+    const importance = hasModel && typeof llmEval.importance === 'number'
+      ? clamp(llmEval.importance + learning.importanceBias + groupImportanceBias, 1, 5)
+      : null
+    let status = summary.pendingIssue ? 'awaiting' : (hasModel && llmEval.status ? llmEval.status : heuristicStatus(summary))
+    if (status === 'done') status = 'doing'
+    const attention = hasModel && typeof llmEval.attention === 'number'
+      ? clamp(llmEval.attention + learning.attentionBias + groupAttentionBias, 0, 100)
+      : null
+    let attentionReason = hasModel ? (llmEval.attentionReason || '') : ''
+    let statusNote = ''
+    if (summary.pendingIssue === 'permission') statusNote = 'Waiting for your permission.'
+    else if (summary.pendingIssue === 'question') statusNote = 'Waiting for your answer.'
+    else if (status === 'blocked') statusNote = cleanLine(summary.lastError, 160)
+    else if (status === 'awaiting') statusNote = attentionReason || 'Waiting for you.'
+    if (status === 'awaiting' && !attentionReason) attentionReason = statusNote
+    return {
+      summary,
+      title: summary.title,
+      subtitle,
+      progress,
+      importance: importance ?? (summary.cached?.importance ?? 3),
+      status,
+      statusNote,
+      attention,
+      attentionReason,
+      groupName,
+      model: hasModel ? modelLabel : null,
+      source: hasModel ? 'model' : 'heuristic',
+    }
+  }
+
+  /**
+   * Fold one Session decision into a reminder item.
+   * @param {object} decision @param {object} activity @param {Set<string>} updatedItemIds
+   * @param {object} settings @param {object} state @param {number} now @param {Map<string,object>} itemEvals
+   */
+  #applyDecision(decision, activity, updatedItemIds, settings, state, now, itemEvals) {
     const store = this.store
-    const state = store.state
-    const settings = state.settings
-    const sorted = [...summaries].sort((a, b) => b.lastActivity - a.lastActivity)
-    const createdThisRun = new Set()
-
-    for (const summary of sorted) {
-      if (summary.lastActivity > now + 60_000) continue
-      const groupName = summary.groupName || DEFAULT_GROUP_NAME
-      const group = store.groupForName(groupName).group
-      store.rememberSession(summary)
-
-      let item = this.#matchItem(summary, group.id)
-      if (item) {
-        const changed = this.#updateItemFromSession(item, summary, group.id, now)
-        activity.updated += changed ? 1 : 0
-        if (changed) {
-          activity.changes.push({
-            itemId: item.id,
-            title: item.title,
-            kind: 'updated',
-            detail: summarizeSession(summary, 'updated'),
-          })
+    const summary = decision.summary
+    const group = store.groupForName(decision.groupName).group
+    store.rememberSession(summary)
+    let item = this.#matchItem(summary, group.id)
+    let created = false
+    if (!item) {
+      item = {
+        id: newId('r'),
+        title: decision.title,
+        subtitle: decision.subtitle,
+        notes: cleanLine(summary.lastAssistantText, 300),
+        nextStep: cleanLine(summary.lastUserText, MAX_NEXT_STEP),
+        groupId: group.id,
+        status: decision.status,
+        statusNote: decision.statusNote,
+        progress: decision.progress,
+        importance: decision.importance,
+        pinned: false,
+        source: 'dream',
+        autoManaged: true,
+        sessionIds: [summary.id],
+        attentionScore: decision.attention ?? 0,
+        attentionReason: decision.attentionReason || decision.statusNote || '',
+        attentionUpdatedAt: now,
+        lastAttentionFlagAt: 0,
+        manualFields: [],
+        lastAutoImportance: decision.importance,
+        lastAutoProgress: decision.progress,
+        createdAt: now,
+        updatedAt: now,
+        lastTouched: summary.lastActivity,
+        lastDreamBatchId: activity.id,
+      }
+      state.items.push(item)
+      created = true
+    } else {
+      const before = structuredClone(item)
+      if (!item.sessionIds.includes(summary.id)) item.sessionIds.push(summary.id)
+      if (item.status !== 'done') {
+        if (!item.manualFields.includes('title') && decision.title) item.title = decision.title
+        if (!item.manualFields.includes('subtitle') && decision.subtitle) item.subtitle = decision.subtitle
+        if (!item.manualFields.includes('progress')) {
+          item.progress = decision.source === 'heuristic'
+            ? Math.max(item.progress, decision.progress)
+            : decision.progress
         }
-      } else if (createdThisRun.size < 8) {
-        item = {
-          id: newId('r'),
-          title: titleForSession(summary),
-          notes: cleanLine(summary.lastAssistantText, 300),
-          nextStep: cleanLine(summary.lastUserText, MAX_NEXT_STEP),
-          groupId: group.id,
-          status: summary.state === 'blocked' ? 'blocked' : 'doing',
-          progress: suggestedProgress(summary),
-          importance: 3,
-          pinned: false,
-          source: 'dream',
-          autoManaged: true,
-          sessionIds: [summary.id],
-          createdAt: now,
-          updatedAt: now,
-          lastTouched: summary.lastActivity,
-          lastDreamBatchId: activity.id,
-        }
-        state.items.push(item)
-        createdThisRun.add(item.id)
-        activity.created += 1
+        if (!item.manualFields.includes('importance') && decision.source !== 'heuristic') item.importance = decision.importance
+        item.status = decision.status
+        item.statusNote = decision.statusNote
+        if (!item.nextStep && summary.lastUserText) item.nextStep = cleanLine(summary.lastUserText, MAX_NEXT_STEP)
+        if (!item.notes && summary.lastAssistantText) item.notes = cleanLine(summary.lastAssistantText, 300)
+        item.lastAutoImportance = decision.importance
+        item.lastAutoProgress = decision.progress
+      }
+      item.lastTouched = Math.max(item.lastTouched, summary.lastActivity)
+      item.updatedAt = now
+      const changedFields = ['title', 'subtitle', 'status', 'progress', 'importance']
+        .some((field) => before[field] !== item[field])
+      if (changedFields) {
+        activity.updated += 1
         activity.changes.push({
           itemId: item.id,
           title: item.title,
-          kind: 'created',
-          detail: summarizeSession(summary, 'created'),
+          kind: 'updated',
+          detail: decision.subtitle || summarizeSession(summary, 'updated'),
         })
       }
     }
+    const itemGrade = itemEvals.get(item.id)
+    const attention = itemGrade?.attention ?? (decision.source === 'cache' ? undefined : decision.attention)
+    if (typeof attention === 'number') {
+      item.attentionScore = attention
+      item.attentionReason = itemGrade?.attentionReason || decision.attentionReason || decision.statusNote || ''
+      item.attentionUpdatedAt = now
+    } else {
+      const heuristic = attentionForItem(item, state.learning, decision.groupName, now)
+      item.attentionScore = heuristic.score
+      item.attentionReason = decision.statusNote || heuristic.reason
+      item.attentionUpdatedAt = now
+    }
+    if (created) {
+      activity.created += 1
+      activity.changes.push({
+        itemId: item.id,
+        title: item.title,
+        kind: 'created',
+        detail: decision.subtitle || summarizeSession(summary, 'created'),
+      })
+    } else if (!itemEvals.has(item.id) && !updatedItemIds.has(item.id) && typeof decision.attention === 'number') {
+      item.attentionScore = decision.attention
+      item.attentionReason = decision.attentionReason
+      item.attentionUpdatedAt = now
+    }
+    updatedItemIds.add(item.id)
+  }
 
-    // Forgotten-work pass: actively tracked items gone quiet past the threshold.
-    const forgetCutoff = now - settings.forgetHours * 3_600_000
+  /**
+   * Apply model grades for every evaluated open item (importance/progress/attention),
+   * never touching manual-locked fields.
+   * @param {object} activity @param {Map<string,object>} itemEvals
+   * @param {object} settings @param {object} state @param {number} now
+   */
+  #applyItemGrades(activity, itemEvals, settings, state, now) {
+    const learning = state.learning
+    for (const [itemId, grade] of itemEvals) {
+      const item = state.items.find((entry) => entry.id === itemId)
+      if (!item || item.status === 'done') continue
+      const groupName = this.store.groupNameOf(item)
+      const groupImportanceBias = learnedGroupBias(learning, groupName, 'importance')
+      const groupAttentionBias = learnedGroupBias(learning, groupName, 'attention')
+      if (typeof grade.importance === 'number' && !item.manualFields.includes('importance')) {
+        item.importance = clamp(grade.importance + learning.importanceBias + groupImportanceBias, 1, 5)
+        item.lastAutoImportance = item.importance
+      }
+      if (typeof grade.progress === 'number' && !item.manualFields.includes('progress')) {
+        item.progress = clamp(grade.progress + learning.progressBias, 0, 100)
+        item.lastAutoProgress = item.progress
+      }
+      if (typeof grade.attention === 'number') {
+        item.attentionScore = clamp(grade.attention + learning.attentionBias + groupAttentionBias, 0, 100)
+        item.attentionReason = grade.attentionReason || item.attentionReason
+        item.attentionUpdatedAt = now
+      }
+      item.updatedAt = now
+    }
+  }
+
+  /**
+   * Refresh attention heuristically for items no evaluation touched this pass.
+   * @param {object} settings @param {object} state @param {number} now
+   */
+  #applyHeuristicAttention(settings, state, now) {
+    const learning = state.learning
     for (const item of state.items) {
-      if (item.status !== 'todo' && item.status !== 'doing' && item.status !== 'blocked') continue
-      if (item.lastTouched > forgetCutoff) continue
-      const ageDays = Math.max(1, Math.round((now - item.lastTouched) / 86_400_000))
+      if (item.status === 'done') continue
+      if (item.attentionUpdatedAt >= now) continue
+      const groupName = this.store.groupNameOf(item)
+      const attention = attentionForItem(item, learning, groupName, now)
+      item.attentionScore = attention.score
+      item.attentionReason = attention.reason
+      item.attentionUpdatedAt = now
+    }
+  }
+
+  /**
+   * Report items whose attention score crosses the threshold, without repeating
+   * the same row on every pass.
+   * @param {object} activity @param {object} state @param {number} now
+   */
+  #flagAttention(activity, state, now) {
+    for (const item of state.items) {
+      if (item.status === 'done') continue
+      if ((item.attentionScore ?? 0) < ATTENTION_THRESHOLD) continue
+      const lastFlag = item.lastAttentionFlagAt || 0
+      if (now - lastFlag < ATTENTION_REFLAG_MS && (item.attentionScore ?? 0) < 85) continue
+      item.lastAttentionFlagAt = now
       activity.attention += 1
       activity.changes.push({
         itemId: item.id,
         title: item.title,
         kind: 'attention',
-        detail: `No activity for ${ageDays} day${ageDays === 1 ? '' : 's'}`,
+        detail: cleanLine(item.attentionReason, 200) || `Attention ${item.attentionScore}`,
       })
     }
   }
@@ -1403,55 +2225,6 @@ class DreamEngine {
       }
     }
     return bestScore >= 0.34 ? best : undefined
-  }
-
-  /**
-   * Merge one Session into an existing item and report whether anything changed.
-   * @param {object} item @param {object} summary @param {string} groupId @param {number} now
-   */
-  #updateItemFromSession(item, summary, groupId, now) {
-    let changed = false
-    if (!item.sessionIds.includes(summary.id)) {
-      item.sessionIds.push(summary.id)
-      changed = true
-    }
-    if (item.groupId !== groupId && this.store.findGroup(groupId)) {
-      item.groupId = groupId
-      changed = true
-    }
-    if (summary.lastActivity > item.lastTouched) {
-      item.lastTouched = summary.lastActivity
-      changed = true
-    }
-    if (item.status !== 'done') {
-      const nextStatus = summary.state === 'blocked' ? 'blocked' : item.status === 'todo' ? 'doing' : item.status
-      if (nextStatus !== item.status) {
-        item.status = nextStatus
-        changed = true
-      }
-      if (item.progress < suggestedProgress(summary)) {
-        item.progress = suggestedProgress(summary)
-        changed = true
-      }
-    }
-    if (summary.lastUserText && !item.nextStep) {
-      item.nextStep = cleanLine(summary.lastUserText, MAX_NEXT_STEP)
-      changed = true
-    }
-    if (summary.lastAssistantText && !item.notes) {
-      item.notes = cleanLine(summary.lastAssistantText, 300)
-      changed = true
-    }
-    if (summary.lastError && item.status !== 'blocked' && item.status !== 'done') {
-      item.status = 'blocked'
-      item.nextStep = summary.lastError
-      changed = true
-    }
-    if (changed) {
-      item.updatedAt = now
-      item.lastDreamBatchId = undefined
-    }
-    return changed
   }
 }
 
@@ -1532,10 +2305,34 @@ async function dispatchAction(store, engine, action, payload, options = {}) {
       await store.persist()
       return { ok: true, value: result }
     }
+    case 'item.unlock': {
+      const item = store.unlockItem(input.id, input.fields)
+      await store.persist()
+      return { ok: true, value: store.itemView(item) }
+    }
     case 'settings.update': {
       const settings = store.updateSettings(input)
       await store.persist()
       return { ok: true, value: settings }
+    }
+    case 'learning.update': {
+      const learning = store.updateLearning(input)
+      await store.persist()
+      return { ok: true, value: learning }
+    }
+    case 'learning.reset': {
+      const learning = store.resetLearning()
+      await store.persist()
+      return { ok: true, value: learning }
+    }
+    case 'learning.clearSignals': {
+      const learning = store.clearLearningSignals()
+      await store.persist()
+      return { ok: true, value: learning }
+    }
+    case 'models.list': {
+      const catalog = await engine.evaluator.listCatalog()
+      return { ok: true, value: catalog }
     }
     case 'dream.run': {
       if (engine.running) return { ok: true, value: { started: false, busy: true } }
@@ -1568,23 +2365,26 @@ function createRemindersTool(store, engine) {
     name: TOOL_NAME,
     description:
       'Maintain the user\'s reminder list of work in progress (the Reminders panel). ' +
-      'Actions: list (grouped snapshot), get (one item), create, update, delete, group_create, ' +
-      'group_delete, dream_run (scan recent Sessions now and fold results in), dream_status, ' +
-      'undo_dream, update_settings. Dreaming may also run automatically; prefer `list` first to ' +
-      'avoid duplicating an item that dreaming already created.',
+      'Actions: list (grouped snapshot), get (one item), create, update, delete, item_unlock, ' +
+      'group_create, group_delete, dream_run (scan recent Sessions now and fold results in), ' +
+      'dream_status, undo_dream, update_settings, learning_status, learning_update, ' +
+      'learning_reset, models_list. Dreaming is LLM-evaluated when enabled, so prefer `list` ' +
+      'first to avoid duplicating an item that dreaming already created.',
     parameters: {
       type: 'object',
       properties: {
         action: {
           type: 'string',
           enum: [
-            'list', 'get', 'create', 'update', 'delete', 'group_create', 'group_delete',
-            'dream_run', 'dream_status', 'undo_dream', 'update_settings',
+            'list', 'get', 'create', 'update', 'delete', 'item_unlock', 'group_create', 'group_delete',
+            'dream_run', 'dream_status', 'undo_dream', 'update_settings', 'learning_status',
+            'learning_update', 'learning_reset', 'models_list',
           ],
           description: 'Operation to run.',
         },
         id: { type: 'string', description: 'Reminder id for get/update/delete, or group id for group_delete.' },
         title: { type: 'string', description: 'Reminder title for create/update (non-empty, at most 200 chars).' },
+        subtitle: { type: 'string', description: 'Short progress summary shown under the title.' },
         notes: { type: 'string', description: 'Free-form notes for the reminder.' },
         nextStep: { type: 'string', description: 'The concrete next step for this work item.' },
         group: { type: 'string', description: 'Group display name: used by list as a filter and by create as a target group.' },
@@ -1598,6 +2398,20 @@ function createRemindersTool(store, engine) {
         dreamEnabled: { type: 'boolean', description: 'Turn automatic dreaming on or off.' },
         dreamIntervalMinutes: { type: 'integer', description: 'Dreaming interval in minutes (1-1440).' },
         windowHours: { type: 'integer', description: 'How far back to scan Sessions, in hours.' },
+        evalMode: { type: 'string', enum: ['model', 'heuristic'], description: 'LLM evaluation or deterministic fallback for dreaming.' },
+        evalProvider: { type: 'string', description: 'Evaluation model provider; empty follows the default model.' },
+        evalModel: { type: 'string', description: 'Evaluation model id; empty follows the default model.' },
+        evalMaxSessions: { type: 'integer', description: 'Changed Sessions evaluated per dreaming pass (1-30).' },
+        evalMaxItems: { type: 'integer', description: 'Open items re-graded per dreaming pass (0-40).' },
+        fields: {
+          type: 'array',
+          items: { type: 'string', enum: MANUAL_FIELDS },
+          description: 'Fields for item_unlock; omit to restore all auto-graded fields.',
+        },
+        learningNotes: { type: 'string', description: 'What the plugin should remember about how the user prioritizes work.' },
+        importanceBias: { type: 'number', description: 'Importance calibration bias (-2..2).' },
+        progressBias: { type: 'integer', description: 'Progress calibration bias (-20..20).' },
+        attentionBias: { type: 'integer', description: 'Attention calibration bias (-20..20).' },
       },
       required: ['action'],
       additionalProperties: false,
@@ -1653,15 +2467,20 @@ async function toolDispatch(store, engine, action, input, signal) {
         .map((item) => ({
           id: item.id,
           title: item.title,
+          subtitle: item.subtitle,
           group: groups.find((group) => group.id === item.groupId)?.name ?? DEFAULT_GROUP_NAME,
           status: item.status,
+          statusNote: item.statusNote,
           progress: item.progress,
           importance: item.importance,
+          attentionScore: item.attentionScore,
+          attentionReason: item.attentionReason,
           freshness: item.freshness,
           pinned: item.pinned,
           nextStep: item.nextStep,
           sessionIds: item.sessionIds,
           lastTouched: item.lastTouched,
+          manualFields: item.manualFields,
         }))
       return { ok: true, value: { groups, items, dream: snapshot.dream, count: items.length } }
     }
@@ -1674,6 +2493,7 @@ async function toolDispatch(store, engine, action, input, signal) {
     case 'create': {
       return dispatchAction(store, engine, 'item.create', {
         title: input.title,
+        subtitle: input.subtitle,
         notes: input.notes,
         nextStep: input.nextStep,
         group: input.group,
@@ -1686,7 +2506,7 @@ async function toolDispatch(store, engine, action, input, signal) {
     }
     case 'update': {
       const patch = { ...(input.patch && typeof input.patch === 'object' ? input.patch : {}) }
-      for (const key of ['title', 'notes', 'nextStep', 'groupId', 'status', 'progress', 'importance', 'pinned']) {
+      for (const key of ['title', 'subtitle', 'notes', 'nextStep', 'groupId', 'status', 'progress', 'importance', 'pinned']) {
         if (Object.prototype.hasOwnProperty.call(input, key)) patch[key] = input[key]
       }
       return dispatchAction(store, engine, 'item.update', { id: input.id, patch })
@@ -1707,14 +2527,36 @@ async function toolDispatch(store, engine, action, input, signal) {
     }
     case 'undo_dream':
       return dispatchAction(store, engine, 'dream.undo', { activityId: input.activityId })
+    case 'item_unlock':
+      return dispatchAction(store, engine, 'item.unlock', { id: input.id, fields: input.fields })
     case 'update_settings':
       return dispatchAction(store, engine, 'settings.update', {
         dreamEnabled: input.dreamEnabled,
         dreamIntervalMinutes: input.dreamIntervalMinutes,
         windowHours: input.windowHours,
+        evalMode: input.evalMode,
+        evalProvider: input.evalProvider,
+        evalModel: input.evalModel,
+        evalMaxSessions: input.evalMaxSessions,
+        evalMaxItems: input.evalMaxItems,
       })
+    case 'learning_status': {
+      await store.ready
+      return { ok: true, value: store.learningView() }
+    }
+    case 'learning_update':
+      return dispatchAction(store, engine, 'learning.update', {
+        notes: input.learningNotes,
+        importanceBias: input.importanceBias,
+        progressBias: input.progressBias,
+        attentionBias: input.attentionBias,
+      })
+    case 'learning_reset':
+      return dispatchAction(store, engine, 'learning.reset', {})
+    case 'models_list':
+      return dispatchAction(store, engine, 'models.list', {})
     default:
-      throw new ReminderError('invalid', `Unknown action "${action}". Use list, get, create, update, delete, group_create, group_delete, dream_run, dream_status, undo_dream, update_settings.`)
+      throw new ReminderError('invalid', `Unknown action "${action}".`)
   }
 }
 
@@ -1747,6 +2589,16 @@ function summarizeToolResult(action, value) {
       return 'Undid the dreaming run.'
     case 'update_settings':
       return 'Updated dreaming settings.'
+    case 'item_unlock':
+      return 'Restored automatic grading for the reminder.'
+    case 'learning_status':
+      return 'Learned preferences for the dreaming evaluator.'
+    case 'learning_update':
+      return 'Updated learned preferences.'
+    case 'learning_reset':
+      return 'Reset learned preferences.'
+    case 'models_list':
+      return 'Available evaluation models.'
     default:
       return 'Done.'
   }
@@ -1808,6 +2660,11 @@ function resolveConfig(config) {
     staleHours: numberOr(raw.staleHours, 24, 1, 720),
     forgetHours: numberOr(raw.forgetHours, 72, 1, 2160),
     maxSessions: numberOr(raw.maxSessions, 12, 1, 50),
+    evalMode: raw.evalMode === 'heuristic' ? 'heuristic' : EVAL_DEFAULTS.evalMode,
+    evalProvider: cleanLine(raw.evalProvider, 120),
+    evalModel: cleanLine(raw.evalModel, 120),
+    evalMaxSessions: numberOr(raw.evalMaxSessions, EVAL_DEFAULTS.evalMaxSessions, 1, 30),
+    evalMaxItems: numberOr(raw.evalMaxItems, EVAL_DEFAULTS.evalMaxItems, 0, 40),
     dataDir: typeof raw.dataDir === 'string' && raw.dataDir.trim().length > 0
       ? raw.dataDir.trim()
       : (typeof process.env.DSH_REMINDERS_DIR === 'string' && process.env.DSH_REMINDERS_DIR.trim().length > 0
@@ -1922,12 +2779,14 @@ export {
   ReminderStore,
   DreamEngine,
   SessionScanner,
+  DreamEvaluator,
   dispatchAction,
   analyzeEvents,
   deriveFreshness,
   jaccard,
   tokenize,
   groupKey,
+  heuristicAttention,
   serveStateRequest,
   serveActionRequest,
   toLosslessJson,
